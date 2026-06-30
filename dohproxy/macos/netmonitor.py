@@ -11,7 +11,10 @@ renew can reset a service's DNS off the local resolver.
 This polls the default route on a fixed interval and, on a change:
 
   * re-applies the tunnel's ifscope/DoH-exclude routes for the new gateway and
-    re-pins the SOCKS upstream to the new interface (DPI runs only);
+    re-pins the SOCKS upstream to the new interface (DPI runs only); this also
+    brings the IPv6 device redirect up when a v6 default route is acquired
+    mid-session (e.g. a VPN coming up) and tears it down when v6 is lost, so v6
+    HTTPS gets the same SNI fragmentation without needing a restart;
   * re-asserts the local resolver across all network services (always, even
     DoH-only) via dns_control.reconcile().
 

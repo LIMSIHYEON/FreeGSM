@@ -235,7 +235,10 @@ def _parse_dst(data: bytes, off: int):
             return None
         (port,) = struct.unpack_from("!H", data, off)
         off += 2
-    except (IndexError, struct.error, UnicodeDecodeError):
+    except (IndexError, struct.error, UnicodeDecodeError, OSError):
+        # OSError: inet_ntoa/inet_ntop reject a truncated address. Treat any
+        # malformed datagram as undecodable (drop it) rather than letting it raise
+        # and tear down the whole UDP association.
         return None
     return host, port, family, off
 

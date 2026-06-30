@@ -170,6 +170,17 @@ BLOCK_QUIC = _env_flag("FREEGSM_BLOCK_QUIC", "block_quic", True)
 # its upstream socket is reaped; DNS uses no per-flow socket so it is unaffected.
 UDP_RELAY_IDLE = 60.0
 
+# --- macOS DPI-off plaintext-DNS kill switch (opt-in, fail-closed) -----------
+# With DPI ON, the tunnel + UDP ASSOCIATE upgrade a hardcoded-DNS app's UDP/53 to
+# DoH. With DPI OFF there is no tunnel, so such an app still leaks plaintext DNS
+# straight to its server. We can't transparently upgrade it (pf rdr can't catch
+# locally-originated traffic), but pf *filtering* can drop it. When this is on
+# AND DPI is off, a pf rule drops outbound UDP/TCP :53 to any non-loopback
+# destination -- fail-closed, like the rest of FreeGSM. Default OFF because it can
+# break an app that depends on reaching a specific external DNS server (split-
+# horizon VPN DNS, Tailscale 100.100.100.100). See macos/pf_control.py.
+BLOCK_PLAINTEXT_DNS = _env_flag("FREEGSM_BLOCK_PLAINTEXT_DNS", "block_plaintext_dns", False)
+
 # --- macOS network-change monitor -------------------------------------------
 # Polls the default route on this interval; when it changes (Wi-Fi<->Ethernet,
 # gateway change, DHCP renew) the tunnel's ifscope/DoH-exclude routes are

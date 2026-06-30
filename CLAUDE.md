@@ -97,6 +97,23 @@ No test suite or linter is configured.
 - `SPLIT_MIN`/`SPLIT_MAX` (6/64) — first-record size bounds, before the SNI.
 - Ports: `TCP_PROXY_PORT=53533`, `HTTPS_PROXY_PORT=53444`. `FAIL_OPEN`,
   `WORKER_THREADS=32`, timeouts.
+- `FREEGSM_BLOCK_PLAINTEXT_DNS=1` (macOS, default off) — DPI-off fail-closed:
+  drops outbound UDP/TCP :53 to non-loopback via pf so a hardcoded-DNS app can't
+  leak plaintext. No-op when DPI is on (the tunnel upgrades that traffic instead).
+
+## Tests
+
+```bash
+# stdlib unittest, no extra deps; run from repo root
+python -m unittest discover -s tests -v
+```
+
+`tests/` covers the macOS port's pure/parsing logic (DPI split, DNS utils,
+config) and the systemy modules whose shell-outs are faked: `tunnel` IPv6
+device-redirect lifecycle, `pf_control` kill switch, `netmonitor` route-change
+trigger, `dns_control` parsing. Tests that import `socks_proxy`/`netmonitor` pull
+in `httpx` and **skip** if it's absent — run in the project venv to exercise
+them. No linter is configured.
 
 ## Known gaps
 
@@ -114,14 +131,20 @@ tun2socks, so a UDP/53 query to an app's hardcoded plaintext DNS server is
 re-resolved over DoH there too (`socks_proxy._dns_over_doh`). UDP/443 (QUIC) is
 dropped when `BLOCK_QUIC` so HTTP/3 falls back to the SNI-fragmented TCP path;
 other UDP is relayed to its real destination (pinned off the utun). So with DPI
-on, hardcoded-DNS apps are covered; the residual gap is **DPI-off** (DoH-only,
-no tunnel), where a hardcoded-DNS app still bypasses to plaintext.
+on, hardcoded-DNS apps are covered. **DPI-off** (DoH-only, no tunnel) can't
+*upgrade* hardcoded DNS (pf `rdr` can't catch locally-originated traffic), but
+opt-in `FREEGSM_BLOCK_PLAINTEXT_DNS=1` (`macos/pf_control.py`) *fail-closes* it: a
+pf rule drops outbound :53 to non-loopback so the query is dropped, not leaked.
+Off by default (it can break apps that need a specific external DNS server).
 
 **macOS IPv6.** When the host has an IPv6 default route, the tunnel redirects
 IPv6 too (`::/1` + `8000::/1` → utun, plus a v6 ifscope default and v6 DoH
 host-route), so IPv6 HTTPS gets the same SNI fragmentation. Disable with
 `FREEGSM_TUNNEL_IPV6=0`. IPv6 acquired *mid-session* (e.g. a VPN coming up after
-start) is not fully redirected until restart.
+start) is now brought up by `netmonitor` without a restart: `tunnel.reapply_routes`
+calls `_enable_v6_device` (utun v6 addr + `::/1`/`8000::/1` device routes) when a
+v6 default appears and `_disable_v6_device` when it's lost. The poll interval
+(`FREEGSM_MONITOR_INTERVAL`, 10s) bounds the delay.
 
 **macOS network-change handling.** `macos/netmonitor.py` polls the default route
 (`FREEGSM_MONITOR_INTERVAL`, default 10s) and, on a change (Wi-Fi↔Ethernet, DHCP

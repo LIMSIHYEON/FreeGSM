@@ -10,6 +10,17 @@
 > 3. **네트워크 변경 견고성** — `netmonitor`가 default route 변화를 폴링해 ifscope/
 >    DoH 제외 라우트 재적용 + SOCKS upstream 재핀 + DNS 재포인트. ([4.1절](#41-네트워크-변경-견고성-netmonitor))
 >
+> **추가 보강 (2026-06-30, 2차):**
+> 4. **세션 중 IPv6 획득/상실 반영** — `netmonitor`가 v6 default 출현 시
+>    `tunnel._enable_v6_device`(utun v6 주소 + `::/1`/`8000::/1`), 소실 시
+>    `_disable_v6_device`를 호출해 재시작 없이 v6 우회를 올리고 내린다.
+> 5. **DPI-off 평문 DNS kill switch (opt-in)** — `FREEGSM_BLOCK_PLAINTEXT_DNS=1`이면
+>    `macos/pf_control.py`가 pf로 비루프백 :53을 drop(fail-closed). 기본 off.
+> 6. **단위 테스트** — `tests/`(stdlib unittest). `python -m unittest discover -s
+>    tests`. tunnel v6 수명주기·pf kill switch·netmonitor 트리거·DPI 분할·DNS 유틸
+>    커버. (이 작업 중 `socks_proxy._parse_dst`의 truncated-addr `OSError` 미처리
+>    버그를 발견·수정.)
+>
 > **상태: 구현 완료 · 라이브 검증됨 (2026-06-26, macOS 26.5.1).**
 > macOS 포팅은 Windows의 WinDivert 패킷 캡처 모델을 쓰지 않는다. pf `rdr`로 같은
 > 모델을 재현하려던 1차 시도(아래 [부록 A](#부록-a--폐기된-pf-rdr-설계기록))는
@@ -146,8 +157,11 @@ association은 tun2socks의 TCP 제어 연결 수명과 묶이고(RFC 1928), `se
 제어 conn·클라이언트 소켓·업스트림 소켓을 한 스레드에서 다중화한다. UDP/53 DoH
 왕복만 블로킹이라 짧은 데몬 스레드 + `BoundedSemaphore`로 분리(리졸버와 동일).
 
-> **남은 한계**: DPI **off**(DoH-only, 터널 없음)에서는 하드코딩 DNS 앱이 여전히
-> 평문으로 빠진다. 또 로컬 SOCKS5는 여기서도 association당 단일 클라이언트만 가정.
+> **DPI off 보완(opt-in)**: 터널이 없으면 하드코딩 DNS를 *업그레이드*할 수 없다(pf
+> `rdr`은 로컬 발신 미가로채기). 대신 `FREEGSM_BLOCK_PLAINTEXT_DNS=1`이면
+> `macos/pf_control.py`가 pf 필터로 비루프백 :53 아웃바운드를 **drop**(fail-closed)
+> 해 평문 누수를 막는다. 특정 외부 DNS에 의존하는 앱을 끊을 수 있어 기본 off.
+> 로컬 SOCKS5는 여기서도 association당 단일 클라이언트만 가정.
 
 ---
 
@@ -287,13 +301,15 @@ teardown은 **monitor를 가장 먼저 정지**해, 라우트/DNS 복원 중에 
 - **DoH 보호 범위 차이**: Windows는 *모든* 아웃바운드 UDP/53·TCP/53을 목적지 불문
   캡처한다. macOS는 시스템 리졸버 스왑(시스템 리졸버 앱) + **DPI on 시 UDP ASSOCIATE로
   하드코딩 DNS 앱의 UDP/53도 DoH로 커버**([2.1절](#21-하드코딩-dns-커버--udp-associate)).
-  **남은 차이**: DPI **off**(터널 없음)에서는 하드코딩 DNS 앱이 여전히 평문으로 빠짐.
+  **DPI off**: 업그레이드는 불가하나 opt-in `FREEGSM_BLOCK_PLAINTEXT_DNS=1`로 pf가
+  비루프백 :53을 drop해 fail-closed(누수 차단). 기본 off([2.1절](#21-하드코딩-dns-커버--udp-associate)).
 - **권한**: root 필요는 동일. pf/Network Extension과 달리 utun·DNS 조작은 코드서명
   없이 root면 가능 (Apple Developer Program 불필요).
 - **QUIC/HTTP-3 (UDP/443)**: DPI on이면 `BLOCK_QUIC`(기본)로 **drop → TCP/443 폴백**
   (분할되는 경로로 유도). DPI off면 Windows와 동일하게 미처리.
-- **IPv6**: v6 default가 있으면 redirect·분할([3.1절](#31-ipv6-우회)). 단 세션 중
-  v6 획득은 재시작 전까지 미반영.
+- **IPv6**: v6 default가 있으면 redirect·분할([3.1절](#31-ipv6-우회)). 세션 중 v6
+  획득/상실은 `netmonitor`가 `tunnel.reapply_routes` → `_enable/_disable_v6_device`
+  로 재시작 없이 반영(폴링 간격만큼 지연).
 - **네트워크 전환**: `netmonitor`가 폴링으로 라우트·핀·DNS 재적용([4.1절](#41-네트워크-변경-견고성-netmonitor)).
   폴링이라 전환~재적용 사이 `MONITOR_INTERVAL`(기본 10s)만큼 지연 가능.
 - **성능**: 443 릴레이가 userspace Python(SOCKS5)을 거치는 점은 동일. 추가로

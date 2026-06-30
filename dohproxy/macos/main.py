@@ -28,7 +28,7 @@ import sys
 import threading
 
 from .. import config, doh
-from . import dns_control, tunnel
+from . import dns_control, pf_control, tunnel
 from .netmonitor import NetworkMonitor
 from .resolver import Resolver
 from . import socks_proxy
@@ -120,6 +120,13 @@ def main() -> int:
                 socks_srv.server_close()
         except Exception:  # noqa: BLE001
             log.exception("SOCKS server teardown failed; continuing to DNS restore")
+        # Remove the pf plaintext-DNS block BEFORE restoring system DNS: the
+        # restored servers are typically external (:53), which our own block would
+        # otherwise drop -- leaving the machine with no DNS. No-op if never armed.
+        try:
+            pf_control.restore()
+        except Exception:  # noqa: BLE001
+            log.exception("pf restore failed; continuing to DNS restore")
         dns_control.restore()
 
     atexit.register(_teardown)
@@ -154,6 +161,14 @@ def main() -> int:
                     socks_srv.server_close()
                     socks_srv = None
                 dpi_on = False
+        # DPI-off only: optionally arm the pf plaintext-DNS kill switch so a
+        # hardcoded-DNS app can't leak to its plaintext server (fail-closed). With
+        # DPI on the tunnel already upgrades that traffic to DoH, and a pf :53
+        # block would instead break it -- so this is mutually exclusive with DPI.
+        if not dpi_on and config.BLOCK_PLAINTEXT_DNS:
+            if not pf_control.install():
+                log.warning("plaintext-DNS kill switch could not be armed; "
+                            "hardcoded-DNS apps may still leak (DoH-only).")
         # Monitor the default route so a network change (Wi-Fi<->Ethernet, DHCP
         # renew) re-applies the tunnel routes / re-pins the SOCKS upstream, and
         # keeps the system DNS pointed at the local resolver. Runs even DoH-only

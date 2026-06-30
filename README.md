@@ -106,11 +106,13 @@ sudo .venv/bin/python3 -m dohproxy.macos.main
   `FREEGSM_TUN2SOCKS=/path/to/tun2socks` 로 지정하세요. 없으면 DoH만 켜집니다.
 - **VPN 주의**: VPN(예: ProtonVPN)은 자체 스코프 리졸버/utun을 쓰므로, VPN 활성
   시 DNS 변경이나 라우팅이 충돌할 수 있습니다. VPN을 끈 상태를 권장합니다.
-- **적용 범위(Windows와 차이)**: macOS판은 *시스템 DNS*를 로컬 리졸버로 돌리는
-  방식이라, **시스템 리졸버를 쓰는 앱만** DoH 보호를 받습니다. `8.8.8.8` 같은
-  DNS 서버를 직접 박아 쓰는 앱은 DoH를 우회하며, DPI를 켠 상태에서는 그런 앱의
-  UDP/53이 막힐 수 있습니다(로컬 SOCKS 프록시가 CONNECT만 지원, UDP ASSOCIATE
-  미지원). 대부분의 앱은 시스템 리졸버를 쓰므로 실사용에는 문제없습니다.
+- **적용 범위(Windows와 차이)**: macOS판은 *시스템 DNS*를 로컬 리졸버로 돌리므로
+  기본적으로 **시스템 리졸버를 쓰는 앱**이 DoH 보호를 받습니다. `8.8.8.8` 처럼 DNS
+  서버를 직접 박아 쓰는 앱은 — **DPI를 켜면** 로컬 SOCKS 프록시의 **UDP ASSOCIATE**
+  가 그 UDP/53도 DoH로 올려 함께 보호합니다. **DPI를 끈 상태**에선 터널이 없어
+  업그레이드는 불가하지만, 원하면 `FREEGSM_BLOCK_PLAINTEXT_DNS=1` 로 그런 평문 :53
+  을 **차단(fail-closed)** 할 수 있습니다(특정 외부 DNS에 의존하는 앱을 끊을 수
+  있어 기본 꺼짐). 대부분의 앱은 시스템 리졸버를 쓰므로 실사용엔 문제없습니다.
 
 > Windows 전용 의존성인 `pydivert` 는 macOS에 빌드가 없으므로, macOS는
 > `requirements.txt` 대신 `requirements-macos.txt`(httpx + pyyaml)만 씁니다.
@@ -136,6 +138,7 @@ dpi_bypass: true                       # false 로 설정하면 443 릴레이 �
 |------|--------|------|
 | `doh_url` | `https://1.0.0.1/dns-query` | DoH 업스트림 URL (반드시 IP로 지정) |
 | `dpi_bypass` | `true` | SNI 우회 릴레이 활성화 여부 |
+| `block_plaintext_dns` | `false` | (macOS, DPI-off) pf로 비루프백 평문 :53 차단(fail-closed) |
 
 ### 환경 변수 (env var가 config.yml보다 우선)
 
@@ -146,6 +149,9 @@ set FREEGSM_DOH_URL=https://9.9.9.9/dns-query   # Quad9
 
 # SNI 우회(443 릴레이) 끄고 DoH만 쓰기
 set FREEGSM_DPI=0
+
+# (macOS, DPI-off) 하드코딩 평문 DNS 누수 차단(fail-closed). 기본 꺼짐.
+FREEGSM_BLOCK_PLAINTEXT_DNS=1 sudo .venv/bin/python3 -m dohproxy.macos.main
 ```
 
 ## 동작 원리
