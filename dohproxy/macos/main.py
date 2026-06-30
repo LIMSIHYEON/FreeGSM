@@ -29,6 +29,7 @@ import threading
 
 from .. import config, doh
 from . import dns_control, tunnel
+from .netmonitor import NetworkMonitor
 from .resolver import Resolver
 from . import socks_proxy
 
@@ -84,6 +85,7 @@ def main() -> int:
     resolver = Resolver()
     socks_srv = None
     tun = None
+    monitor = None
     try:
         resolver.start()
     except OSError as exc:
@@ -101,6 +103,12 @@ def main() -> int:
         # exception in an earlier step must never skip it. atexit re-runs this in
         # the same order, so a step that reliably threw would otherwise strand DNS
         # at 127.0.0.1 with the resolver dead -- bricking the machine's DNS.
+        # Stop the monitor FIRST so it can't re-add routes/DNS as we tear them down.
+        try:
+            if monitor is not None:
+                monitor.stop()
+        except Exception:  # noqa: BLE001
+            log.exception("monitor teardown failed; continuing to route/DNS restore")
         try:
             if tun is not None:
                 tun.stop()
@@ -146,6 +154,12 @@ def main() -> int:
                     socks_srv.server_close()
                     socks_srv = None
                 dpi_on = False
+        # Monitor the default route so a network change (Wi-Fi<->Ethernet, DHCP
+        # renew) re-applies the tunnel routes / re-pins the SOCKS upstream, and
+        # keeps the system DNS pointed at the local resolver. Runs even DoH-only
+        # (tun is None) to re-assert DNS across newly added/renewed services.
+        monitor = NetworkMonitor(tun if dpi_on else None)
+        monitor.start()
         log.info("Running. DNS upgraded to DoH%s. Press Ctrl+C to stop.",
                  " + SNI/443 fragmentation active" if dpi_on else "")
         stop.wait()

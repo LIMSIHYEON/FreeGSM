@@ -107,10 +107,25 @@ the first `recv` (true for a <16 KB hello).
 
 **macOS DoH coverage differs from Windows.** Windows captures *all* outbound
 UDP/53 + TCP/53 regardless of destination, so apps with a hardcoded DNS server
-are intercepted too. The macOS port instead repoints the *system* resolver at
-loopback, so it only covers apps that use the system resolver. An app that talks
-straight to a hardcoded plaintext DNS server (e.g. `8.8.8.8:53`) bypasses DoH —
-and with DPI *on* its UDP/53 may even break, because the local SOCKS5 proxy
-implements only CONNECT (no UDP ASSOCIATE), so tun2socks can't forward that
-datagram. Practically fine (most apps use the system resolver), but it is a real
-protection-scope difference worth knowing.
+are intercepted too. The macOS port repoints the *system* resolver at loopback
+(covers system-resolver apps) **and**, when DPI is on, the SOCKS5 proxy now
+implements **UDP ASSOCIATE**: every outbound UDP datagram reaches it via
+tun2socks, so a UDP/53 query to an app's hardcoded plaintext DNS server is
+re-resolved over DoH there too (`socks_proxy._dns_over_doh`). UDP/443 (QUIC) is
+dropped when `BLOCK_QUIC` so HTTP/3 falls back to the SNI-fragmented TCP path;
+other UDP is relayed to its real destination (pinned off the utun). So with DPI
+on, hardcoded-DNS apps are covered; the residual gap is **DPI-off** (DoH-only,
+no tunnel), where a hardcoded-DNS app still bypasses to plaintext.
+
+**macOS IPv6.** When the host has an IPv6 default route, the tunnel redirects
+IPv6 too (`::/1` + `8000::/1` → utun, plus a v6 ifscope default and v6 DoH
+host-route), so IPv6 HTTPS gets the same SNI fragmentation. Disable with
+`FREEGSM_TUNNEL_IPV6=0`. IPv6 acquired *mid-session* (e.g. a VPN coming up after
+start) is not fully redirected until restart.
+
+**macOS network-change handling.** `macos/netmonitor.py` polls the default route
+(`FREEGSM_MONITOR_INTERVAL`, default 10s) and, on a change (Wi-Fi↔Ethernet, DHCP
+renew), re-applies the tunnel's ifscope/DoH-exclude routes, re-pins the SOCKS
+upstream (`socks_proxy.set_bound_iface`), and re-asserts the local resolver
+across services (`dns_control.reconcile`). Teardown stops the monitor FIRST so it
+can't re-add what teardown is removing.

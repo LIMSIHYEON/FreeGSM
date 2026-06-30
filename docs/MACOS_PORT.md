@@ -1,5 +1,15 @@
 # FreeGSM — macOS 포팅 설계서
 
+> **개선 추가 (2026-06-30):** 아래 세 항목을 보강했다. 단위 테스트는 통과했고,
+> 실제 utun/네트워크 전환 라이브 검증은 별도로 필요하다.
+> 1. **하드코딩 DNS 커버** — SOCKS5 **UDP ASSOCIATE** 구현. DPI on이면 utun으로
+>    들어온 UDP/53(앱이 직접 `8.8.8.8:53` 등에 말하는 질의)을 DoH로 올린다.
+>    QUIC(UDP/443)은 drop(보호 유지), 그 외 UDP는 실서버로 NAT 릴레이. ([2.1절](#21-하드코딩-dns-커버--udp-associate))
+> 2. **IPv6 SNI 우회** — v6 default가 있으면 IPv6도 utun으로 redirect(`::/1`+`8000::/1`),
+>    v6 SNI도 분할. `FREEGSM_TUNNEL_IPV6=0`로 끔. ([3.1절](#31-ipv6-우회))
+> 3. **네트워크 변경 견고성** — `netmonitor`가 default route 변화를 폴링해 ifscope/
+>    DoH 제외 라우트 재적용 + SOCKS upstream 재핀 + DNS 재포인트. ([4.1절](#41-네트워크-변경-견고성-netmonitor))
+>
 > **상태: 구현 완료 · 라이브 검증됨 (2026-06-26, macOS 26.5.1).**
 > macOS 포팅은 Windows의 WinDivert 패킷 캡처 모델을 쓰지 않는다. pf `rdr`로 같은
 > 모델을 재현하려던 1차 시도(아래 [부록 A](#부록-a--폐기된-pf-rdr-설계기록))는
@@ -116,6 +126,31 @@ networksetup -getdnsservers Wi-Fi        # 원래 값으로 복원됐는지 확�
 
 ---
 
+### 2.1 하드코딩 DNS 커버 — UDP ASSOCIATE
+
+시스템 DNS 스왑은 *시스템 리졸버를 쓰는 앱*만 커버한다. 평문 DNS 서버에 직접
+말하는 앱(`8.8.8.8:53` 하드코딩)은 빠져나간다. **DPI on일 때만** 이를 막을 수
+있다: default route override(0/1+128/1)는 UDP에도 적용되므로 그 UDP/53도 utun으로
+들어오고, tun2socks가 SOCKS5 **UDP ASSOCIATE**로 프록시에 넘긴다. 기존 프록시는
+CONNECT만 구현해 그 데이터그램을 못 흘려 *깨졌었다* — 이제 UDP ASSOCIATE를 구현.
+
+`socks_proxy._udp_associate`의 분기:
+
+| 대상 | 처리 |
+|------|------|
+| **UDP/53** | 페이로드를 DNS 질의로 보고 `doh.resolve` → DoH 응답을 원 목적지(예 `8.8.8.8:53`) 헤더로 감싸 회신. fail-closed(실패 시 무응답). 오버사이즈 응답은 TC=1로 잘라 TCP 재시도 유도(리졸버와 동일). |
+| **UDP/443 (QUIC)** | `BLOCK_QUIC`(기본 on)이면 **drop** → HTTP/3가 분할되는 TCP/443로 폴백(QUIC SNI 노출 방지). |
+| **그 외 UDP** | 실서버로 NAT 릴레이(per-(host,port) 업스트림 소켓, `IP_BOUND_IF`로 utun 우회, `UDP_RELAY_IDLE`초 후 회수). NTP/게임 등 호환성 확보. |
+
+association은 tun2socks의 TCP 제어 연결 수명과 묶이고(RFC 1928), `selectors`로
+제어 conn·클라이언트 소켓·업스트림 소켓을 한 스레드에서 다중화한다. UDP/53 DoH
+왕복만 블로킹이라 짧은 데몬 스레드 + `BoundedSemaphore`로 분리(리졸버와 동일).
+
+> **남은 한계**: DPI **off**(DoH-only, 터널 없음)에서는 하드코딩 DNS 앱이 여전히
+> 평문으로 빠진다. 또 로컬 SOCKS5는 여기서도 association당 단일 클라이언트만 가정.
+
+---
+
 ## 3. SNI/443 우회 — utun + tun2socks + SOCKS5
 
 Network Extension은 Apple Developer 계정이 필요하므로, **utun 방식**으로 간다(root만
@@ -173,6 +208,26 @@ python verify_lolps.py [host]       # SNI 분할 동작 확인
 
 ---
 
+### 3.1 IPv6 우회
+
+처음엔 IPv4만 redirect하고 IPv6 HTTPS는 SNI가 노출됐다(경고만 출력). 이제 호스트에
+IPv6 default route가 있으면 v6도 터널에 태운다:
+
+1. utun에 ULA v6 주소 부여 (`ifconfig utunX inet6 fd00:6f73:6d00::1 prefixlen 64`).
+2. v6 ifscope default (`route add -inet6 -ifscope <if6> default <gw6>`) — SOCKS
+   업스트림(`IPV6_BOUND_IF` 핀)이 utun 밖으로 나갈 경로. v4 ifscope와 동일 원리.
+3. v6 DoH 제외 host-route — `DOH_URL`이 리터럴 v6일 때만(`DOH_SERVER_IP6`).
+4. v6 default override (`route add -inet6 -net ::/1`/`8000::/1 -interface utunX`).
+
+`netutil.split_relay`/SOCKS 업스트림 로직은 이미 family 무관이라 그대로 v6를 처리.
+모든 v6 단계는 **best-effort** — 실패해도 동작 중인 v4 터널을 절대 깨지 않고 v6만
+포기한다(그 경우 v6 SNI 노출, 경고). `FREEGSM_TUNNEL_IPV6=0`로 v6 redirect 비활성.
+
+> v6 default가 **세션 중**에 생기면(예: 시작 후 VPN) 재시작 전까지 완전 redirect되지
+> 않는다(utun v6 주소/디바이스 라우트는 start에서만 추가). netmonitor는 ifscope만 갱신.
+
+---
+
 ## 4. 통합 main / 생명주기 / 원복
 
 [`macos/main.py`](../dohproxy/macos/main.py): root 체크 → DoH upstream probe(fail-closed,
@@ -186,6 +241,25 @@ python verify_lolps.py [host]       # SNI 분할 동작 확인
   격리·idempotent이라 앞 단계 예외가 DNS 복원을 건너뛰지 못한다. `finally` +
   `signal`(SIGINT/SIGTERM/SIGHUP) + `atexit` 삼중으로 보장.
 - **SIGHUP**: `run_macos.sh`를 띄운 터미널을 닫으면 정상 종료·복원.
+
+---
+
+### 4.1 네트워크 변경 견고성 (netmonitor)
+
+Wi-Fi↔이더넷 전환·게이트웨이 변경·DHCP 갱신이 일어나면 `_gw`/`_iface`에 묶인
+ifscope default·DoH 제외 host-route와 SOCKS의 `IP_BOUND_IF` 핀이 **stale**해져
+업스트림이 `ENETUNREACH`로 죽는다. `macos/netmonitor.py`가 `MONITOR_INTERVAL`
+(기본 10s)마다 default route를 폴링해 변화 시:
+
+- **터널 재적용** (`Tunnel.reapply_routes`): 디바이스 라우트(`.../1 → utun`)는
+  그대로 두고 scoped 라우트만 삭제 후 새 gw/iface로 재생성 → 앱 트래픽은 끊김 없이
+  계속 터널로 흐른다. `socks_proxy.set_bound_iface`로 업스트림 핀도 갱신.
+- **DNS 재확인** (`dns_control.reconcile`): DPI 여부와 무관하게 항상 수행. 시작 후
+  추가된 서비스(이더넷 연결·VPN)는 실 DNS를 **백업 후** `127.0.0.1`로, DHCP 갱신으로
+  로컬 리졸버에서 벗어난 서비스는 백업을 **건드리지 않고** 다시 `127.0.0.1`로.
+
+teardown은 **monitor를 가장 먼저 정지**해, 라우트/DNS 복원 중에 모니터가 그것을
+다시 추가하는 레이스를 막는다. 데몬 스레드라 비정상 종료 시 함께 사라진다.
 
 ---
 
@@ -210,16 +284,18 @@ python verify_lolps.py [host]       # SNI 분할 동작 확인
 
 ## 6. 알려진 차이 / 한계 (Windows 대비)
 
-- **DoH 보호 범위 차이** (가장 중요): Windows는 *모든* 아웃바운드 UDP/53·TCP/53을
-  목적지 불문 캡처하므로 DNS 서버를 하드코딩한 앱도 가로챈다. macOS 포팅은 *시스템*
-  리졸버를 로컬로 재설정할 뿐이라 **시스템 리졸버를 쓰는 앱만** 커버한다. 평문 DNS
-  서버(`8.8.8.8:53` 등)로 직접 말하는 앱은 DoH를 우회하고, **DPI on 시 그 UDP/53은
-  깨질 수도** 있다(로컬 SOCKS5는 CONNECT만 구현, UDP ASSOCIATE 없음 → tun2socks가
-  그 데이터그램을 못 흘림). 대부분의 앱은 시스템 리졸버를 써서 실사용엔 문제 없지만
-  실제 보호 범위 차이다.
+- **DoH 보호 범위 차이**: Windows는 *모든* 아웃바운드 UDP/53·TCP/53을 목적지 불문
+  캡처한다. macOS는 시스템 리졸버 스왑(시스템 리졸버 앱) + **DPI on 시 UDP ASSOCIATE로
+  하드코딩 DNS 앱의 UDP/53도 DoH로 커버**([2.1절](#21-하드코딩-dns-커버--udp-associate)).
+  **남은 차이**: DPI **off**(터널 없음)에서는 하드코딩 DNS 앱이 여전히 평문으로 빠짐.
 - **권한**: root 필요는 동일. pf/Network Extension과 달리 utun·DNS 조작은 코드서명
   없이 root면 가능 (Apple Developer Program 불필요).
-- **QUIC/HTTP-3 (UDP/443)**: Windows와 동일하게 미처리.
+- **QUIC/HTTP-3 (UDP/443)**: DPI on이면 `BLOCK_QUIC`(기본)로 **drop → TCP/443 폴백**
+  (분할되는 경로로 유도). DPI off면 Windows와 동일하게 미처리.
+- **IPv6**: v6 default가 있으면 redirect·분할([3.1절](#31-ipv6-우회)). 단 세션 중
+  v6 획득은 재시작 전까지 미반영.
+- **네트워크 전환**: `netmonitor`가 폴링으로 라우트·핀·DNS 재적용([4.1절](#41-네트워크-변경-견고성-netmonitor)).
+  폴링이라 전환~재적용 사이 `MONITOR_INTERVAL`(기본 10s)만큼 지연 가능.
 - **성능**: 443 릴레이가 userspace Python(SOCKS5)을 거치는 점은 동일. 추가로
   tun2socks utun 홉이 더해진다.
 - **VPN 공존**: VPN의 utun/스코프 리졸버와 충돌 가능 (2절 참조).

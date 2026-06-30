@@ -77,14 +77,26 @@ def resolve_tun2socks() -> str | None:
     return None
 
 
+def default_route6() -> tuple[str | None, str | None]:
+    """(gateway, interface) of the real IPv6 default route, or (None, None).
+
+    The gateway is often a link-local address with a zone id (fe80::1%en0);
+    ``route`` accepts it verbatim, so it is used as-is."""
+    out = _run(["route", "-n", "get", "-inet6", "default"], check=False)
+    if out.returncode != 0:
+        return None, None
+    gw = iface = None
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("gateway:"):
+            gw = line.split()[1]
+        elif line.startswith("interface:"):
+            iface = line.split()[1]
+    return gw, iface
+
+
 def _iface_exists(dev: str) -> bool:
     return _run(["ifconfig", dev], check=False).returncode == 0
-
-
-def _ipv6_default_exists() -> bool:
-    """True if the host has an IPv6 default route we are NOT redirecting."""
-    out = _run(["route", "-n", "get", "-inet6", "default"], check=False)
-    return out.returncode == 0 and "gateway:" in out.stdout
 
 
 # --------------------------------------------------------------------------- #
@@ -169,20 +181,57 @@ class Tunnel:
         self._proc: subprocess.Popen | None = None
         self._gw: str | None = None
         self._iface: str | None = None
+        self._gw6: str | None = None
+        self._iface6: str | None = None
         self._routes: list[list[str]] = []  # add-arg lists, deleted in reverse
+        # Subset of self._routes that depend on the default gateway/interface
+        # (ifscope defaults + DoH host-routes). These are torn down and rebuilt
+        # by reapply_routes() when the network changes; the device routes
+        # (0/1, 128/1, ::/1, 8000/1 -> utun) stay valid across such changes.
+        self._scoped: list[list[str]] = []
 
     # -- routes -------------------------------------------------------------- #
-    def _add_route(self, dest_args: list[str], required: bool = False) -> None:
+    def _add_route(self, dest_args: list[str], required: bool = False,
+                   scoped: bool = False) -> None:
         cp = _run(["route", "-n", "add", *dest_args], check=False)
         # Record the route BEFORE checking the result so stop()/reconcile always
         # deletes whatever the kernel may have created, even on a partial failure.
         self._routes.append(dest_args)
+        if scoped:
+            self._scoped.append(dest_args)
         if self._proc is not None:
             _save_state(self._proc.pid, self._routes)
         if required and cp.returncode != 0:
             raise RuntimeError(
                 f"failed to add required route {dest_args}: {cp.stderr.strip()}"
             )
+
+    def _add_scoped_routes(self, strict: bool) -> None:
+        """Add the gateway/interface-dependent routes: an ifscope default per
+        family (so IP_BOUND_IF upstream sockets have a route off the utun) and a
+        host-route excluding the DoH upstream (so our own resolver channel is
+        never tunnelled/fragmented). ``strict`` raises on a required IPv4 failure
+        (startup); reapply passes False so a transient failure is just logged."""
+        self._add_route(["-ifscope", self._iface, "default", self._gw],
+                        required=strict, scoped=True)
+        log.info("scoped default added: default via %s (ifscope %s)", self._gw, self._iface)
+        if config.DOH_SERVER_IP:
+            self._add_route(["-host", config.DOH_SERVER_IP, self._gw],
+                            required=strict, scoped=True)
+            log.info("DoH upstream %s excluded via %s", config.DOH_SERVER_IP, self._gw)
+        # IPv6 is always best-effort: a failure here leaves IPv6 SNI exposed but
+        # must never take down the working IPv4 tunnel.
+        if self._gw6 and self._iface6:
+            try:
+                self._add_route(["-inet6", "-ifscope", self._iface6, "default", self._gw6],
+                                scoped=True)
+                if config.DOH_SERVER_IP6:
+                    self._add_route(["-inet6", "-host", config.DOH_SERVER_IP6, self._gw6],
+                                    scoped=True)
+                log.info("scoped IPv6 default added: default via %s (ifscope %s)",
+                         self._gw6, self._iface6)
+            except Exception:  # noqa: BLE001
+                log.exception("IPv6 scoped route setup failed; IPv6 upstream may break")
 
     # -- lifecycle ----------------------------------------------------------- #
     def start(self) -> None:
@@ -213,10 +262,19 @@ class Tunnel:
                     f"{self._dev} already exists and is not ours; refusing to set up tunnel"
                 )
 
-        if _ipv6_default_exists():
-            log.warning("Host has an IPv6 default route; FreeGSM only redirects IPv4, "
-                        "so IPv6 HTTPS bypasses the SNI splitter and its SNI stays "
-                        "exposed. Disable IPv6 on this network for full coverage.")
+        # IPv6: redirect it too (so v6 HTTPS gets the same SNI fragmentation) when
+        # enabled AND the host actually has a v6 default route. Best-effort -- a v6
+        # failure later must never break the v4 tunnel, so we only note the gw/iface
+        # here and let _add_scoped_routes / the device-route block degrade quietly.
+        if config.TUNNEL_IPV6:
+            self._gw6, self._iface6 = default_route6()
+            if self._gw6 and self._iface6:
+                log.info("real IPv6 default route: %s via %s", self._gw6, self._iface6)
+        if config.TUNNEL_IPV6 and not (self._gw6 and self._iface6):
+            log.info("no IPv6 default route; IPv6 not redirected (nothing to cover).")
+        elif not config.TUNNEL_IPV6 and default_route6()[0]:
+            log.warning("FREEGSM_TUNNEL_IPV6 is off but the host has an IPv6 default "
+                        "route; IPv6 HTTPS bypasses the SNI splitter (SNI exposed).")
 
         self._proc = subprocess.Popen(
             [self._bin, "-device", self._dev,
@@ -243,30 +301,76 @@ class Tunnel:
         _run(["ifconfig", self._dev, self._addr, self._addr, "up"])
         log.info("tunnel device %s up (%s) via tun2socks", self._dev, self._addr)
 
-        # Scoped default on the physical interface, so the SOCKS proxy's
-        # upstream sockets (pinned with IP_BOUND_IF) have a route off the utun.
-        # Without this, an ifscope lookup finds nothing and connects fail with
-        # ENETUNREACH. App sockets (no IP_BOUND_IF) still use the global 0/1
-        # route into the utun, so they remain fragmented.
-        # Every route below is required: a missing scoped default makes the SOCKS
-        # upstream sockets fail with ENETUNREACH; a missing DoH host-route would
-        # tunnel (and fragment) our own resolver channel; missing /1 halves mean
-        # traffic never enters the tunnel. Any failure raises so main.py degrades
-        # cleanly to DoH-only (calling stop(), which deletes the partial routes)
-        # rather than running a half-built tunnel that silently bypasses the DPI
-        # splitter or breaks DNS.
-        self._add_route(["-ifscope", self._iface, "default", self._gw], required=True)
-        log.info("scoped default added: default via %s (ifscope %s)", self._gw, self._iface)
+        # Give the utun an IPv6 address so tun2socks can carry v6 flows. If this
+        # fails, drop v6 redirection entirely (keep v4 working) rather than adding
+        # v6 routes that black-hole into an interface with no usable v6 address.
+        if self._gw6 and self._iface6:
+            cp = _run(["ifconfig", self._dev, "inet6", config.TUN_ADDR6,
+                       "prefixlen", str(config.TUN_PREFIX6)], check=False)
+            if cp.returncode != 0:
+                log.warning("could not add IPv6 addr to %s (%s); IPv6 not redirected",
+                            self._dev, cp.stderr.strip())
+                self._gw6 = self._iface6 = None
 
-        # Keep the DoH channel direct (never tunnel our own resolver upstream).
-        if config.DOH_SERVER_IP:
-            self._add_route(["-host", config.DOH_SERVER_IP, self._gw], required=True)
-            log.info("DoH upstream %s excluded via %s", config.DOH_SERVER_IP, self._gw)
+        # Scoped defaults on the physical interface, so the SOCKS proxy's upstream
+        # sockets (pinned with IP_BOUND_IF) have a route off the utun. Without
+        # this, an ifscope lookup finds nothing and connects fail with
+        # ENETUNREACH. App sockets (no IP_BOUND_IF) still use the global 0/1 (and
+        # ::/1) route into the utun, so they remain fragmented. The IPv4 routes
+        # here are required: any failure raises so main.py degrades cleanly to
+        # DoH-only (calling stop(), which deletes the partial routes) rather than
+        # running a half-built tunnel that bypasses the splitter or breaks DNS.
+        self._add_scoped_routes(strict=True)
 
         # Override the default route with two /1 halves pointing at the utun.
         self._add_route(["-net", "0.0.0.0/1", "-interface", self._dev], required=True)
         self._add_route(["-net", "128.0.0.0/1", "-interface", self._dev], required=True)
         log.info("default route now via %s (0/1 + 128/1)", self._dev)
+
+        # IPv6 default override (best-effort): a failure leaves v6 SNI exposed but
+        # must not disturb the working v4 tunnel.
+        if self._gw6 and self._iface6:
+            cp1 = _run(["route", "-n", "add", "-inet6", "-net", "::/1",
+                        "-interface", self._dev], check=False)
+            self._routes.append(["-inet6", "-net", "::/1", "-interface", self._dev])
+            cp2 = _run(["route", "-n", "add", "-inet6", "-net", "8000::/1",
+                        "-interface", self._dev], check=False)
+            self._routes.append(["-inet6", "-net", "8000::/1", "-interface", self._dev])
+            if self._proc is not None:
+                _save_state(self._proc.pid, self._routes)
+            if cp1.returncode == 0 and cp2.returncode == 0:
+                log.info("IPv6 default route now via %s (::/1 + 8000::/1)", self._dev)
+            else:
+                log.warning("IPv6 default override incomplete (%s / %s); v6 SNI may "
+                            "stay exposed", cp1.stderr.strip(), cp2.stderr.strip())
+
+    def reapply_routes(self, gw: str, iface: str,
+                       gw6: str | None = None, iface6: str | None = None) -> None:
+        """Re-point the gateway/interface-dependent routes after a network change.
+        Deletes the old ifscope/DoH-exclude routes and rebuilds them for the new
+        default route; the device routes (.../1 -> utun) are left untouched, so
+        app traffic keeps flowing into the tunnel throughout. Best-effort: a
+        failure is logged so the next poll can retry."""
+        for dest_args in list(self._scoped):
+            _run(["route", "-n", "delete", *dest_args], check=False)
+            try:
+                self._routes.remove(dest_args)
+            except ValueError:
+                pass
+        self._scoped.clear()
+        self._gw, self._iface = gw, iface
+        self._gw6, self._iface6 = gw6, iface6
+        try:
+            self._add_scoped_routes(strict=False)
+        finally:
+            if self._proc is not None:
+                _save_state(self._proc.pid, self._routes)
+        log.info("tunnel scoped routes re-applied for %s via %s", gw, iface)
+
+    def current(self) -> tuple[str | None, str | None, str | None, str | None]:
+        """Last-applied (gw, iface, gw6, iface6); the monitor compares this to
+        the live default route to decide whether to reapply."""
+        return self._gw, self._iface, self._gw6, self._iface6
 
     def stop(self) -> None:
         # Delete routes first (reverse order), so traffic falls back to the real

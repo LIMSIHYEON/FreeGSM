@@ -196,6 +196,43 @@ def _install_locked() -> None:
     log.info("System DNS repointed to local resolver (%d service(s)).", len(services))
 
 
+def reconcile() -> None:
+    """Re-assert the local resolver across services after a network change.
+
+    Catches two drifts that install() can't anticipate: a network service added
+    or enabled after start (e.g. plugging in Ethernet, connecting a VPN), and an
+    existing service whose DNS was reset off 127.0.0.1 by a DHCP renew. A new
+    service's real DNS is backed up before we repoint it; an existing service's
+    original backup is left untouched (we never overwrite the user's real servers
+    with a transient DHCP value). No-op until install() has run."""
+    with _lock:
+        _reconcile_locked()
+
+
+def _reconcile_locked() -> None:
+    if _state is None:
+        return  # install() not active -- nothing to re-assert
+    changed = False
+    for svc in _list_services():
+        try:
+            current = _get_dns(svc)
+        except subprocess.SubprocessError:
+            continue
+        if current == [config.LOCAL_DNS_HOST]:
+            continue  # already pointed at us
+        if svc not in _state:
+            _state[svc] = current  # newly seen service: capture its real DNS
+            log.info("new network service %r; backed up DNS %s",
+                     svc, current or "DHCP")
+        # else: an existing service drifted (DHCP renew); keep its original backup.
+        if _set_dns(svc, [config.LOCAL_DNS_HOST]):
+            log.info("re-pointed DNS for %r -> %s", svc, config.LOCAL_DNS_HOST)
+            changed = True
+    if changed:
+        _save_backup(_state)
+        _flush_cache()
+
+
 def restore() -> None:
     """Restore the original DNS servers. Idempotent and thread-safe: safe to call
     from a finally block, a signal handler, and atexit all at once."""

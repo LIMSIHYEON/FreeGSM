@@ -82,6 +82,23 @@ def _doh_host() -> str | None:
 
 DOH_SERVER_IP = _doh_host()
 
+
+# Literal IPv6 form of the DoH upstream, if any. The macOS tunnel excludes this
+# (via an inet6 host route) so the DoH channel stays direct even when IPv6 is
+# redirected. None when DOH_URL points at a hostname or an IPv4 literal.
+def _doh_host6() -> str | None:
+    host = urlparse(DOH_URL).hostname  # urlparse strips the [] from [::1]
+    if not host:
+        return None
+    try:
+        ipaddress.IPv6Address(host)
+    except ValueError:
+        return None
+    return host
+
+
+DOH_SERVER_IP6 = _doh_host6()
+
 # Seconds to wait for a DoH round-trip before giving up (and, fail-closed,
 # dropping the query).
 DOH_TIMEOUT = 5.0
@@ -129,9 +146,37 @@ SOCKS_PROXY_PORT = 1080
 # safe to use for a local tunnel endpoint.
 TUN_DEVICE = "utun123"
 TUN_ADDR = "198.18.0.1"
+# IPv6 point-to-point address for the utun and whether to redirect IPv6 at all.
+# When on, the default route is split for IPv6 too (::/1 + 8000::/1 -> utun) so
+# IPv6 HTTPS gets the same SNI fragmentation as IPv4; otherwise IPv6 traffic
+# bypasses the splitter and its SNI stays exposed. fd00::/8 is a unique-local
+# (RFC 4193) range, the IPv6 analogue of the private 198.18/15 used above.
+TUN_ADDR6 = "fd00:6f73:6d00::1"
+TUN_PREFIX6 = 64
+TUNNEL_IPV6 = _env_flag("FREEGSM_TUNNEL_IPV6", "tunnel_ipv6", True)
 # Path to the tun2socks binary. Override via FREEGSM_TUN2SOCKS; otherwise the
 # launcher looks on PATH and in ./bin.
 TUN2SOCKS_PATH = os.environ.get("FREEGSM_TUN2SOCKS") or _yaml.get("tun2socks_path") or "tun2socks"
+
+# --- macOS UDP-over-SOCKS (closes the hardcoded-DNS gap) ---------------------
+# With the tunnel up, ALL outbound UDP enters the utun, so tun2socks forwards it
+# to the SOCKS proxy via UDP ASSOCIATE. The proxy upgrades UDP/53 (apps talking
+# straight to a plaintext DNS server, bypassing the system resolver) to DoH, and
+# relays other UDP to the real destination (pinned off the utun like the TCP
+# upstream). UDP/443 (QUIC) is dropped when BLOCK_QUIC so HTTP/3 falls back to
+# the SNI-fragmented TCP path rather than leaking an unfragmented QUIC SNI.
+BLOCK_QUIC = _env_flag("FREEGSM_BLOCK_QUIC", "block_quic", True)
+# Idle lifetime (seconds) of a relayed non-DNS UDP "flow" (dst host:port) before
+# its upstream socket is reaped; DNS uses no per-flow socket so it is unaffected.
+UDP_RELAY_IDLE = 60.0
+
+# --- macOS network-change monitor -------------------------------------------
+# Polls the default route on this interval; when it changes (Wi-Fi<->Ethernet,
+# gateway change, DHCP renew) the tunnel's ifscope/DoH-exclude routes are
+# re-applied, the SOCKS upstream re-pinned to the new interface, and any network
+# service whose DNS drifted off the local resolver is re-pointed.
+MONITOR_INTERVAL = float(os.environ.get("FREEGSM_MONITOR_INTERVAL")
+                         or _yaml.get("monitor_interval") or 10.0)
 
 # --- DPI / SNI-blocking bypass ----------------------------------------------
 # DoH only protects DNS. Many networks (notably Korean school/ISP filters) ALSO
