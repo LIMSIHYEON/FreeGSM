@@ -15,3 +15,6 @@ venv/
 
 # macOS: fetched third-party tun2socks binary (downloaded by run_macos.sh)
 /bin/
+
+# CodeGraph local index (per-machine, not shared)
+/.codegraph/
