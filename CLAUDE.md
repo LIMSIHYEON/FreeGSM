@@ -183,6 +183,18 @@ VPN's routes/resolver risks bricking DNS): (1) a VPN setting DNS via configd
 (via `netstat -rn`) reports it and the monitor warns the SNI splitter is bypassed.
 `./verify_macos.sh vpn` surfaces both.
 
+The **reverse** also happens and is *not* warned: with DPI on, FreeGSM's own
+`0/1`+`128/1` are more specific than a VPN's `0/0` default, so they shadow it, and
+the SOCKS upstream is pinned to the *physical* iface (`IP_BOUND_IF`) — so app TCP
+exits via the real link, **bypassing the VPN tunnel and exposing the real IP**
+(SNI is still fragmented; a full-tunnel VPN run for anonymity is silently
+defeated). `netmonitor` treats a gateway-less VPN default (`route get default` →
+`via utunN` with no gateway) as "link down" and keeps the SOCKS pin on the
+physical iface rather than chasing the VPN's utun (which would loop / has no usable
+scoped gateway), so this is the intended route-war outcome, not a re-pin bug.
+Running two full-tunnel tools at once is the fundamental conflict; FreeGSM does not
+fight it. Confirmed live (ProtonVPN + DPI on): traffic kept exiting `en0`.
+
 **macOS IPv6.** When the host has an IPv6 default route, the tunnel redirects
 IPv6 too (`::/1` + `8000::/1` → utun, plus a v6 ifscope default and v6 DoH
 host-route), so IPv6 HTTPS gets the same SNI fragmentation. Disable with
