@@ -111,6 +111,21 @@ FAIL_OPEN = False
 # Number of worker threads handling captured packets / DoH round-trips.
 WORKER_THREADS = 32
 
+# --- DNS cache (macOS DoH path) ---------------------------------------------
+# An in-memory, TTL-aware cache in front of doh.resolve (see dnscache.py). Keyed
+# on the question; serves repeated lookups from memory with the new query's ID and
+# decremented TTLs, so a burst of identical queries costs one DoH round-trip. Any
+# parse anomaly falls through to an un-cached resolve, so fail-closed is intact.
+# Used by both ports: the macOS resolver + SOCKS UDP/53 path, and the Windows
+# UDP/53 + TCP/53 handlers (all call dnscache.resolve).
+DNS_CACHE = _env_flag("FREEGSM_DNS_CACHE", "dns_cache", True)
+# Hard cap on cached entries (oldest/expired evicted past this) and on any single
+# entry's lifetime, so a pathological TTL can't pin a stale answer for days.
+DNS_CACHE_MAX = int(os.environ.get("FREEGSM_DNS_CACHE_MAX")
+                    or _yaml.get("dns_cache_max") or 4096)
+DNS_CACHE_MAX_TTL = int(os.environ.get("FREEGSM_DNS_CACHE_MAX_TTL")
+                        or _yaml.get("dns_cache_max_ttl") or 86400)
+
 # --- TCP transparent proxy --------------------------------------------------
 # Local listener that terminates redirected TCP/53 connections. Redirected
 # packets are aimed at the machine's own interface IP (injecting toward
@@ -180,6 +195,18 @@ UDP_RELAY_IDLE = 60.0
 # break an app that depends on reaching a specific external DNS server (split-
 # horizon VPN DNS, Tailscale 100.100.100.100). See macos/pf_control.py.
 BLOCK_PLAINTEXT_DNS = _env_flag("FREEGSM_BLOCK_PLAINTEXT_DNS", "block_plaintext_dns", False)
+
+# --- macOS DPI-off QUIC kill switch (opt-in) --------------------------------
+# With DPI ON, the SOCKS proxy already drops UDP/443 (BLOCK_QUIC) so HTTP/3 falls
+# back to the SNI-fragmented TCP path. With DPI OFF there is no tunnel and no
+# splitter, so an app's QUIC/HTTP-3 traffic goes out unprotected. This opt-in pf
+# rule (DPI-off only) drops outbound UDP/443 to any non-loopback destination, so
+# HTTP/3 apps fall back to plain TCP/443. It does NOT hide the SNI (nothing can
+# without the tunnel) -- its value is forcing TCP on networks that block/throttle
+# QUIC wholesale and keeping a consistent fail-closed posture. TCP/443 is never
+# blocked (that would kill all HTTPS) and the DoH channel rides TCP, so it is
+# unaffected. Default OFF. See macos/pf_control.py.
+BLOCK_PLAINTEXT_QUIC = _env_flag("FREEGSM_BLOCK_PLAINTEXT_QUIC", "block_plaintext_quic", False)
 
 # --- macOS network-change monitor -------------------------------------------
 # Polls the default route on this interval; when it changes (Wi-Fi<->Ethernet,

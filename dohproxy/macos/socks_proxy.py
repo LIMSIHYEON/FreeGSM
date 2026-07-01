@@ -34,7 +34,7 @@ import subprocess
 import threading
 import time
 
-from .. import config, doh, netutil
+from .. import config, dnscache, netutil
 from ..dnsutil import describe_query, truncated_response, udp_payload_limit
 
 log = logging.getLogger("dohproxy.macos.socks")
@@ -381,7 +381,7 @@ def _dns_over_doh(relay: socket.socket, client, dst_hdr: bytes, query: bytes) ->
         desc = describe_query(query)
         log.info("[INTERCEPT] UDP/53(hardcoded)  %s", desc)
         try:
-            answer = doh.resolve(query)
+            answer = dnscache.resolve(query)
         except Exception as exc:  # noqa: BLE001 - fail-closed
             log.warning("[FAILED]    UDP/53  %s  -> DoH error: %s; dropped", desc, exc)
             return

@@ -27,7 +27,7 @@ import threading
 
 from pydivert.consts import Direction
 
-from . import config, doh
+from . import config, dnscache
 from .dnsutil import describe_query
 
 log = logging.getLogger("dohproxy.tcp")
@@ -113,7 +113,7 @@ class _Handler(socketserver.BaseRequestHandler):
             log.info("[INTERCEPT] TCP  %s  (from %s)", desc, self.client_address[0])
 
             try:
-                answer = doh.resolve(query)
+                answer = dnscache.resolve(query)
             except Exception as exc:  # noqa: BLE001 - fail-closed
                 log.warning("[FAILED]    TCP  %s  -> DoH error: %s; closing", desc, exc)
                 return  # closing the socket = fail-closed for this query

@@ -21,6 +21,36 @@
 >    커버. (이 작업 중 `socks_proxy._parse_dst`의 truncated-addr `OSError` 미처리
 >    버그를 발견·수정.)
 >
+> **추가 보강 (2026-07-01, 3차):**
+> 7. **TTL-aware DNS 캐시** — `dohproxy/dnscache.py`. `doh.resolve` 앞단의 인메모리
+>    캐시로 반복 질의를 메모리에서 응답(질의 ID·0x20 케이스 재작성, RR TTL을 경과
+>    시간만큼 감산). 질문(qname/qtype/qclass + EDNS DO 비트) 기준 키. 파싱 이상 시
+>    무캐시 `doh.resolve`로 폴백(fail-closed 유지). macOS 리졸버 + SOCKS UDP/53만
+>    사용(Windows 핸들러는 그대로 직접 호출). `FREEGSM_DNS_CACHE=0`로 끔. ([2.2절](#22-dns-캐시))
+> 8. **이벤트 구동 netmonitor** — `PF_ROUTE`(`AF_ROUTE`) 커널 라우팅 소켓을 읽어
+>    라우트 변화를 1초 미만에 반영. `MONITOR_INTERVAL`(10s)은 라우트 메시지로 못
+>    잡는 drift(DHCP 갱신 DNS 변경 등)용 *바닥값*으로만 남김. 소켓 못 열면 폴링
+>    폴백. ([4.1절](#41-네트워크-변경-견고성-netmonitor))
+> 9. **라이브 검증 하니스** — `./verify_macos.sh`(status/doh/cache/sni/ipv6/
+>    netchange/killswitch/vpn). 상태 읽기 + `dig` 프로브만(시스템 무변경).
+>    netchange·vpn은 가이드형(사용자가 링크/VPN 전환, 스크립트가 재적용 확인).
+>    단위 테스트가 닿지 못하는 실 utun/네트워크 경로 검증용. ([5절](#5-배포--패키징))
+>
+> **추가 보강 (2026-07-01, 4차):**
+> 10. **DPI-off QUIC kill switch (opt-in)** — `FREEGSM_BLOCK_PLAINTEXT_QUIC=1`이면
+>    `pf_control`이 비루프백 UDP/443을 drop → HTTP/3가 TCP/443로 폴백. TCP/443은
+>    절대 막지 않음(전체 HTTPS 보호). SNI를 숨기진 못하고(터널 없으면 불가) QUIC를
+>    통째로 막는 망에서 TCP 강제 + fail-closed 일관성이 목적. 기본 off. ([2.1절](#21-하드코딩-dns-커버--udp-associate))
+> 11. **DNS 캐시 Windows 이식** — `dnscache`가 이제 양 플랫폼 공용. Windows
+>    `udp_handler`/`tcp_proxy`도 `doh.resolve` 대신 `dnscache.resolve` 호출(반복
+>    질의 메모리 히트, DoH 부하 감소). fail-closed·stateless 불변식 그대로. ([2.2절](#22-dns-캐시))
+> 12. **VPN 공존 견고화** — 풀터널 VPN이 조용히 FreeGSM을 무력화하는 두 경우를
+>    `netmonitor`가 *감지·경고*(자동 대응 안 함 — VPN 라우트/리졸버와 싸우면 DNS를
+>    브릭할 위험): (a) VPN이 configd로 DNS를 설정해 유효 primary 리졸버가
+>    `127.0.0.1`이 아니게 되면 `dns_control.verify_primary_resolver`(`scutil --dns`)가
+>    DoH 우회 경고, (b) VPN이 같은 `0/1`+`128/1` 트릭으로 디바이스 라우트를 뺏으면
+>    `tunnel.device_routes_intact`(`netstat -rn`)가 SNI 분할 우회 경고. `verify_macos.sh vpn`이 둘 다 확인. ([6절](#6-알려진-차이--한계-windows-대비))
+>
 > **상태: 구현 완료 · 라이브 검증됨 (2026-06-26, macOS 26.5.1).**
 > macOS 포팅은 Windows의 WinDivert 패킷 캡처 모델을 쓰지 않는다. pf `rdr`로 같은
 > 모델을 재현하려던 1차 시도(아래 [부록 A](#부록-a--폐기된-pf-rdr-설계기록))는
@@ -162,6 +192,40 @@ association은 tun2socks의 TCP 제어 연결 수명과 묶이고(RFC 1928), `se
 > `macos/pf_control.py`가 pf 필터로 비루프백 :53 아웃바운드를 **drop**(fail-closed)
 > 해 평문 누수를 막는다. 특정 외부 DNS에 의존하는 앱을 끊을 수 있어 기본 off.
 > 로컬 SOCKS5는 여기서도 association당 단일 클라이언트만 가정.
+>
+> **DPI off QUIC(opt-in)**: 같은 `pf_control`이 `FREEGSM_BLOCK_PLAINTEXT_QUIC=1`이면
+> 비루프백 **UDP/443(QUIC)**도 drop → HTTP/3가 TCP/443로 폴백한다. **TCP/443은 절대
+> 막지 않는다**(막으면 전체 HTTPS·DoH가 죽는다). 터널이 없으니 SNI를 숨기진 못하고,
+> QUIC를 통째로 차단·스로틀하는 망에서 TCP를 강제하고 fail-closed 일관성을 지키는
+> 것이 목적. 기본 off. DPI on이면 SOCKS가 이미 drop하므로 상호배타(pf 미사용).
+
+---
+
+### 2.2 DNS 캐시
+
+`doh.resolve`는 의도적으로 stateless다(질의 바이트 == DoH 본문, 파싱 0). 대신
+`dohproxy/dnscache.py`가 그 앞단에 **옵트아웃 가능한 인메모리 캐시**를 둔다(기본 on,
+`FREEGSM_DNS_CACHE=0`로 끔). stateless 불변식은 그대로 둔 채, 별도 모듈에서 필요한
+만큼만 와이어 포맷을 파싱하고 **어떤 이상이든 무캐시 `doh.resolve`로 폴백**한다 — 즉
+캐시는 네트워크 왕복을 메모리 히트로 바꿀 뿐, 답을 만들거나 망가뜨릴 수 없다(fail-closed
+유지).
+
+| 항목 | 처리 |
+|------|------|
+| **키** | 질문 = 소문자 QNAME + QTYPE + QCLASS + EDNS **DO 비트**. txn ID·0x20 케이스·EDNS 패딩만 다른 질의는 한 엔트리를 공유. |
+| **히트** | 캐시 응답을 새 질의의 ID로, 질문 바이트를 새 질의의 0x20 케이스로 재작성하고, 모든 RR TTL을 **저장 후 경과 초만큼 감산**(클라이언트가 멈춘 TTL을 보지 않음). |
+| **저장 대상** | 단일 질문·표준 질의(opcode 0)·비잘림 NOERROR/NXDOMAIN·양수 최소 TTL만. 음수 응답은 SOA MINIMUM으로 캡(RFC 2308). |
+| **경계** | `DNS_CACHE_MAX`(4096) 초과 시 만료분 먼저, 그다음 오래된 것부터 evict. `DNS_CACHE_MAX_TTL`(86400s)로 단일 엔트리 수명 상한. |
+
+리졸버(UDP/TCP)와 SOCKS UDP/53(하드코딩 DNS) 경로가 같은 프로세스 캐시를 공유한다.
+라이브 검증: example.com A를 두 번 — miss ~28ms → hit ~0ms, ID 재작성·TTL 감산·실
+응답(압축 포인터·OPT 레코드 포함) 모두 정상.
+
+**Windows도 이제 공용**: `dnscache`는 순수하게 `config`+`doh`만 의존하는 플랫폼
+무관 모듈이라, Windows `udp_handler`(UDP/53)·`tcp_proxy`(TCP/53) 핸들러도
+`doh.resolve` 대신 `dnscache.resolve`를 호출하도록 바꿨다. 반복 질의가 메모리 히트로
+바뀌고 DoH 부하가 준다. `FREEGSM_DNS_CACHE=0`로 양쪽 모두 끌 수 있고, fail-closed·
+stateless 불변식은 그대로다(캐시 이상 시 무캐시 `doh.resolve`로 폴백).
 
 ---
 
@@ -262,18 +326,24 @@ IPv6 default route가 있으면 v6도 터널에 태운다:
 
 Wi-Fi↔이더넷 전환·게이트웨이 변경·DHCP 갱신이 일어나면 `_gw`/`_iface`에 묶인
 ifscope default·DoH 제외 host-route와 SOCKS의 `IP_BOUND_IF` 핀이 **stale**해져
-업스트림이 `ENETUNREACH`로 죽는다. `macos/netmonitor.py`가 `MONITOR_INTERVAL`
-(기본 10s)마다 default route를 폴링해 변화 시:
+업스트림이 `ENETUNREACH`로 죽는다. `macos/netmonitor.py`는 **이벤트 구동**이다:
+커널 `PF_ROUTE`(`AF_ROUTE`) 라우팅 소켓을 읽어 라우트 add/change/delete 메시지가
+오는 즉시(서브초) 반응하고, `MONITOR_INTERVAL`(기본 10s)은 라우트 메시지로 못 잡는
+drift(서비스 DNS만 바뀌는 DHCP 갱신 등)를 위한 *바닥값*으로만 남긴다. 라우팅 소켓을
+못 열면(드문 경우) 기존처럼 폴링으로 폴백. 라우트 버스트는 `_drain` + 짧은 settle로
+한 번의 reconcile로 합친다. 변화 시:
 
 - **터널 재적용** (`Tunnel.reapply_routes`): 디바이스 라우트(`.../1 → utun`)는
   그대로 두고 scoped 라우트만 삭제 후 새 gw/iface로 재생성 → 앱 트래픽은 끊김 없이
-  계속 터널로 흐른다. `socks_proxy.set_bound_iface`로 업스트림 핀도 갱신.
+  계속 터널로 흐른다. `socks_proxy.set_bound_iface`로 업스트림 핀도 갱신. v6 default
+  획득/상실도 여기서 `_enable/_disable_v6_device`로 반영.
 - **DNS 재확인** (`dns_control.reconcile`): DPI 여부와 무관하게 항상 수행. 시작 후
   추가된 서비스(이더넷 연결·VPN)는 실 DNS를 **백업 후** `127.0.0.1`로, DHCP 갱신으로
   로컬 리졸버에서 벗어난 서비스는 백업을 **건드리지 않고** 다시 `127.0.0.1`로.
 
-teardown은 **monitor를 가장 먼저 정지**해, 라우트/DNS 복원 중에 모니터가 그것을
-다시 추가하는 레이스를 막는다. 데몬 스레드라 비정상 종료 시 함께 사라진다.
+teardown은 **monitor를 가장 먼저 정지**(self-pipe로 `select()`를 깨움)해, 라우트/DNS
+복원 중에 모니터가 그것을 다시 추가하는 레이스를 막는다. 데몬 스레드라 비정상 종료
+시 함께 사라진다.
 
 ---
 
@@ -289,6 +359,11 @@ teardown은 **monitor를 가장 먼저 정지**해, 라우트/DNS 복원 중에 
   `/Library/LaunchDaemons`에 복사 후 `launchctl bootstrap`(시작)/`bootout`(중지,
   SIGTERM→정상 teardown). 검증 완료(start→`127.0.0.1#53`+200, stop→DHCP 복원).
 - ✅ **터미널 종료 시 원복**: main.py가 SIGHUP 처리 → 띄운 터미널을 닫으면 정상 복원.
+- ✅ **라이브 검증 하니스**: [`verify_macos.sh`](../verify_macos.sh) — 단위 테스트가
+  닿지 못하는 실 utun/네트워크 경로(`status/doh/cache/sni/ipv6/netchange/killswitch/
+  vpn`)를 상태 읽기 + `dig` 프로브로 확인(시스템 무변경). `netchange`·`vpn`은
+  가이드형(사용자가 링크/VPN을 전환하면 스크립트가 ifscope 재적용·DNS 지속·누수
+  차단을 확인). FreeGSM 기동 후 다른 터미널에서 실행.
 - ⚠️ **.pkg 빌드 스크립트**: [`packaging/build_macos_pkg.sh`](../packaging/build_macos_pkg.sh)
   작성됨 — ad-hoc 서명(`codesign --sign -`) + `pkgbuild`까지. **Developer ID 서명·
   공증은 미적용** → 타인 배포 시 Gatekeeper 경고(우클릭 > 열기 필요). 공개 배포용
@@ -306,15 +381,23 @@ teardown은 **monitor를 가장 먼저 정지**해, 라우트/DNS 복원 중에 
 - **권한**: root 필요는 동일. pf/Network Extension과 달리 utun·DNS 조작은 코드서명
   없이 root면 가능 (Apple Developer Program 불필요).
 - **QUIC/HTTP-3 (UDP/443)**: DPI on이면 `BLOCK_QUIC`(기본)로 **drop → TCP/443 폴백**
-  (분할되는 경로로 유도). DPI off면 Windows와 동일하게 미처리.
+  (분할되는 경로로 유도). DPI off면 기본 미처리이나 opt-in
+  `FREEGSM_BLOCK_PLAINTEXT_QUIC=1`로 pf가 UDP/443을 drop해 TCP 강제(SNI는 못 숨김,
+  fail-closed)([2.1절](#21-하드코딩-dns-커버--udp-associate)).
 - **IPv6**: v6 default가 있으면 redirect·분할([3.1절](#31-ipv6-우회)). 세션 중 v6
   획득/상실은 `netmonitor`가 `tunnel.reapply_routes` → `_enable/_disable_v6_device`
-  로 재시작 없이 반영(폴링 간격만큼 지연).
-- **네트워크 전환**: `netmonitor`가 폴링으로 라우트·핀·DNS 재적용([4.1절](#41-네트워크-변경-견고성-netmonitor)).
-  폴링이라 전환~재적용 사이 `MONITOR_INTERVAL`(기본 10s)만큼 지연 가능.
-- **성능**: 443 릴레이가 userspace Python(SOCKS5)을 거치는 점은 동일. 추가로
-  tun2socks utun 홉이 더해진다.
-- **VPN 공존**: VPN의 utun/스코프 리졸버와 충돌 가능 (2절 참조).
+  로 재시작 없이 반영(라우트 소켓이라 거의 즉시).
+- **네트워크 전환**: `netmonitor`가 `PF_ROUTE` 라우팅 소켓으로 라우트·핀·DNS를
+  서브초 재적용([4.1절](#41-네트워크-변경-견고성-netmonitor)). `MONITOR_INTERVAL`은
+  drift용 바닥값. (이전엔 폴링이라 최대 10s 지연.)
+- **성능**: 443 릴레이가 userspace Python(SOCKS5) + tun2socks utun 홉을 거치는 점은
+  동일. DNS는 `dnscache`로 반복 질의가 메모리 히트라 체감 개선([2.2절](#22-dns-캐시)).
+- **VPN 공존**: 풀터널 VPN이 조용히 무력화하는 두 경우를 `netmonitor`가 **감지·경고**
+  (자동 대응 X — VPN 라우트/리졸버와 싸우면 DNS 브릭 위험): (a) VPN이 configd로 DNS를
+  설정해 유효 primary 리졸버가 `127.0.0.1`이 아니게 되면 `dns_control.verify_primary_resolver`
+  (`scutil --dns`, `reconcile`에서 호출)가 DoH 우회 경고, (b) VPN이 같은 `0/1`+`128/1`
+  트릭으로 디바이스 라우트를 뺏으면 `tunnel.device_routes_intact`(`netstat -rn`)가 SNI
+  분할 우회 경고. `verify_macos.sh vpn`이 둘을 자동 확인 + VPN 토글 가이드.
 
 ---
 

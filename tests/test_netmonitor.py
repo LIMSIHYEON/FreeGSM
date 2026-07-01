@@ -7,6 +7,8 @@ route-reading shell-outs are faked, so no root or real network is involved.
 
 from __future__ import annotations
 
+import socket
+import threading
 import unittest
 from unittest import mock
 
@@ -17,15 +19,19 @@ except Exception:  # noqa: BLE001 - netmonitor pulls socks_proxy -> httpx
 
 
 class _FakeTun:
-    def __init__(self, gw="10.0.0.1", iface="en0", gw6=None, iface6=None):
+    def __init__(self, gw="10.0.0.1", iface="en0", gw6=None, iface6=None, stolen=None):
         self._cur = (gw, iface, gw6, iface6)
         self.reapplied: list[tuple] = []
+        self.stolen = stolen or []  # device_routes_intact() return value
 
     def current(self):
         return self._cur
 
     def reapply_routes(self, gw, iface, gw6=None, iface6=None):
         self.reapplied.append((gw, iface, gw6, iface6))
+
+    def device_routes_intact(self):
+        return self.stolen
 
 
 @unittest.skipIf(netmonitor is None, "netmonitor (httpx) not importable here")
@@ -75,6 +81,84 @@ class NetMonitorTest(unittest.TestCase):
         self._patch_routes((None, None), (None, None))
         mon._tick()
         self.assertEqual(tun.reapplied, [])
+
+    def test_device_route_hijack_warns_once_then_clears(self):
+        # A VPN stole our /1 override: the gateway is unchanged (so no reapply) but
+        # the monitor must still warn -- once -- that the splitter is bypassed.
+        tun = _FakeTun(gw="10.0.0.1", iface="en0", stolen=["0/1 -> utun9"])
+        mon = netmonitor.NetworkMonitor(tun)
+        self._patch_routes(("10.0.0.1", "en0"), (None, None))
+        with mock.patch.object(netmonitor.config, "TUNNEL_IPV6", False):
+            with self.assertLogs("dohproxy.macos.monitor", level="WARNING") as cm:
+                mon._tick()
+            self.assertTrue(any("BYPASSED" in m for m in cm.output))
+            self.assertTrue(mon._device_warned)
+            # Still stolen next tick: no duplicate warning.
+            with mock.patch.object(netmonitor.log, "warning") as warn:
+                mon._tick()
+                warn.assert_not_called()
+            # Routes recovered: flag clears.
+            tun.stolen = []
+            mon._tick()
+            self.assertFalse(mon._device_warned)
+
+
+@unittest.skipIf(netmonitor is None, "netmonitor (httpx) not importable here")
+class NetMonitorLoopTest(unittest.TestCase):
+    """The route-socket-driven wake-up loop and its polling fallback."""
+
+    def test_route_message_triggers_a_tick(self):
+        # Feed the loop a fake routing socket (one end of a socketpair) and write
+        # to it to simulate a kernel route message; the loop must run a tick.
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        a.setblocking(False)
+        fired = threading.Event()
+        mon = netmonitor.NetworkMonitor(None)
+        with mock.patch.object(mon, "_open_route_socket", return_value=a), \
+             mock.patch.object(netmonitor, "_SETTLE", 0.01), \
+             mock.patch.object(mon, "_tick", side_effect=lambda: fired.set()):
+            mon.start()
+            b.send(b"\x00" * 16)  # simulate a routing message
+            self.assertTrue(fired.wait(2.0), "route message did not trigger a tick")
+            mon.stop()
+        self.assertFalse(mon._thread.is_alive())
+
+    def test_polling_fallback_ticks_when_no_route_socket(self):
+        fired = threading.Event()
+        mon = netmonitor.NetworkMonitor(None)
+        with mock.patch.object(mon, "_open_route_socket", return_value=None), \
+             mock.patch.object(netmonitor.config, "MONITOR_INTERVAL", 0.02), \
+             mock.patch.object(mon, "_tick", side_effect=lambda: fired.set()):
+            mon.start()
+            self.assertTrue(fired.wait(2.0), "polling fallback never ticked")
+            mon.stop()
+        self.assertFalse(mon._thread.is_alive())
+
+    def test_stop_is_clean_when_idle(self):
+        # No route traffic and a long interval: stop() must still wake the select
+        # and join promptly via the self-pipe rather than waiting out the floor.
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        a.setblocking(False)
+        mon = netmonitor.NetworkMonitor(None)
+        with mock.patch.object(mon, "_open_route_socket", return_value=a), \
+             mock.patch.object(netmonitor.config, "MONITOR_INTERVAL", 30.0):
+            mon.start()
+            mon.stop()
+        self.assertFalse(mon._thread.is_alive())
+
+    def test_drain_empties_pending_messages(self):
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        a.setblocking(False)
+        b.send(b"x" * 32)
+        netmonitor._drain(a)  # must not raise and must consume the backlog
+        with self.assertRaises(BlockingIOError):
+            a.recv(4096)
 
 
 if __name__ == "__main__":

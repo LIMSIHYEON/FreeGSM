@@ -57,6 +57,24 @@ class PfRulesetTest(unittest.TestCase):
         # Apple's anchors are preserved so system features keep working.
         self.assertIn('load anchor "com.apple" from "/etc/pf.anchors/com.apple"', rs)
 
+    def test_quic_block_is_opt_in_and_udp_443_only(self):
+        # Default ruleset does not touch :443 at all.
+        rs = pf_control.build_ruleset()
+        self.assertNotIn("port = 443", rs)
+        # With QUIC on, UDP/443 to non-loopback is dropped for both families...
+        rq = pf_control.build_ruleset(block_quic=True)
+        self.assertIn("block drop out quick proto udp from any to !127.0.0.0/8 port = 443", rq)
+        self.assertIn("block drop out quick proto udp from any to !::1 port = 443", rq)
+        # ...but TCP/443 is NEVER blocked (that would kill all HTTPS, incl. DoH).
+        self.assertNotIn("proto tcp from any to !127.0.0.0/8 port = 443", rq)
+
+    def test_quic_only_omits_dns_block(self):
+        # QUIC-only (DNS block off): :53 rules absent, :443 present, anchors intact.
+        rs = pf_control.build_ruleset(block_dns=False, block_quic=True)
+        self.assertNotIn("port = 53", rs)
+        self.assertIn("port = 443", rs)
+        self.assertLess(rs.index("nat-anchor"), rs.index("block drop"))
+
     def test_parse_token(self):
         self.assertEqual(pf_control._parse_token("Token : 12345\n"), "12345")
         self.assertEqual(pf_control._parse_token("pf enabled\nToken : 9\n"), "9")
@@ -137,6 +155,21 @@ class PfLifecycleTest(unittest.TestCase):
         n = len(pf.calls)
         self.assertTrue(self._install(pf))  # second call: already active
         self.assertEqual(len(pf.calls), n)
+
+    def test_install_refuses_when_no_block_requested(self):
+        pf = _Pfctl()
+        with mock.patch.object(pf_control, "_run", pf):
+            self.assertFalse(pf_control.install(block_dns=False, block_quic=False))
+        self.assertFalse(pf_control._active)
+        self.assertEqual(pf.calls, [])  # pf untouched
+
+    def test_install_writes_requested_quic_rules(self):
+        pf = _Pfctl()
+        with mock.patch.object(pf_control, "_run", pf):
+            self.assertTrue(pf_control.install(block_dns=False, block_quic=True))
+        rs = pf_control.RULES_FILE.read_text(encoding="utf-8")
+        self.assertIn("port = 443", rs)
+        self.assertNotIn("port = 53", rs)
 
     def test_restore_uses_persisted_token_after_crash(self):
         # Simulate a crashed run: marker on disk, no in-memory state.

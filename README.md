@@ -101,6 +101,11 @@ sudo .venv/bin/python3 -m dohproxy.macos.main
   **Ctrl+C**(또는 실행한 터미널 닫기)로 종료하면 DNS·라우팅이 복원됩니다(비정상
   종료 대비 DNS·터널 상태를 디스크에 저장해 다음 실행 때 자동 복구).
 - **SNI 우회 끄기**: `FREEGSM_DPI=0 ./run_macos.sh` (DoH만; tun2socks 불필요).
+- **DNS 캐시**: 반복 질의를 메모리에서 응답해 빨라집니다(TTL을 지켜 감산, 기본 켜짐).
+  끄려면 `FREEGSM_DNS_CACHE=0`.
+- **라이브 검증**: 기동 후 다른 터미널에서 `./verify_macos.sh` (DoH·캐시·SNI·IPv6
+  자동 확인 + 네트워크 전환/킬스위치/VPN 가이드 검증). 상태 읽기·`dig`만 하므로
+  시스템을 바꾸지 않습니다.
 - **tun2socks**: brew 포뮬러가 없어 `run_macos.sh` 가 GitHub 릴리스 바이너리를
   `./bin/tun2socks` 로 자동 내려받습니다. 직접 둘 경우 PATH나 `./bin` 에 놓거나
   `FREEGSM_TUN2SOCKS=/path/to/tun2socks` 로 지정하세요. 없으면 DoH만 켜집니다.
@@ -139,6 +144,7 @@ dpi_bypass: true                       # false 로 설정하면 443 릴레이 �
 | `doh_url` | `https://1.0.0.1/dns-query` | DoH 업스트림 URL (반드시 IP로 지정) |
 | `dpi_bypass` | `true` | SNI 우회 릴레이 활성화 여부 |
 | `block_plaintext_dns` | `false` | (macOS, DPI-off) pf로 비루프백 평문 :53 차단(fail-closed) |
+| `dns_cache` | `true` | (macOS) TTL-aware DNS 캐시. `dns_cache_max`(4096), `dns_cache_max_ttl`(86400s) |
 
 ### 환경 변수 (env var가 config.yml보다 우선)
 
@@ -152,6 +158,9 @@ set FREEGSM_DPI=0
 
 # (macOS, DPI-off) 하드코딩 평문 DNS 누수 차단(fail-closed). 기본 꺼짐.
 FREEGSM_BLOCK_PLAINTEXT_DNS=1 sudo .venv/bin/python3 -m dohproxy.macos.main
+
+# (macOS) DNS 캐시 끄기. 기본 켜짐.
+FREEGSM_DNS_CACHE=0 sudo .venv/bin/python3 -m dohproxy.macos.main
 ```
 
 ## 동작 원리

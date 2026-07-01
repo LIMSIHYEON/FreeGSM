@@ -1,10 +1,11 @@
 """UDP/53 handling: stateless DoH response synthesis.
 
 An outbound UDP DNS query is captured, its payload (the DNS query) is resolved
-over DoH, and the *same* packet object is turned into the reply by swapping
-addresses/ports and replacing the payload, then injected back inbound. pydivert
-updates the IP/UDP length fields when the payload is reassigned and recomputes
-checksums on send().
+over DoH (through the TTL-aware ``dnscache`` in front of the stateless DoH
+client, so repeated lookups are answered from memory), and the *same* packet
+object is turned into the reply by swapping addresses/ports and replacing the
+payload, then injected back inbound. pydivert updates the IP/UDP length fields
+when the payload is reassigned and recomputes checksums on send().
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import logging
 
 from pydivert.consts import Direction
 
-from . import config, doh
+from . import config, dnscache
 from .dnsutil import describe_query
 
 log = logging.getLogger("dohproxy.udp")
@@ -34,7 +35,7 @@ def handle(packet, send) -> None:
     log.info("[INTERCEPT] UDP  %s  (from %s)", desc, packet.src_addr)
 
     try:
-        answer = doh.resolve(query)
+        answer = dnscache.resolve(query)
     except Exception as exc:  # noqa: BLE001 - fail-closed on anything
         if config.FAIL_OPEN:
             log.warning("[FAILED]    UDP  %s  -> DoH error: %s; forwarding plaintext", desc, exc)

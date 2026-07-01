@@ -23,7 +23,7 @@ import struct
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from .. import config, doh, netutil
+from .. import config, dnscache, netutil
 from ..dnsutil import describe_query, truncated_response, udp_payload_limit
 
 log = logging.getLogger("dohproxy.macos.resolver")
@@ -87,7 +87,7 @@ class _UDPResolver:
         desc = describe_query(query)
         log.info("[INTERCEPT] UDP  %s", desc)
         try:
-            answer = doh.resolve(query)
+            answer = dnscache.resolve(query)
         except Exception as exc:  # noqa: BLE001 - fail-closed
             log.warning("[FAILED]    UDP  %s  -> DoH error: %s; dropped", desc, exc)
             return
@@ -145,7 +145,7 @@ class _TCPHandler(socketserver.BaseRequestHandler):
             desc = describe_query(query)
             log.info("[INTERCEPT] TCP  %s", desc)
             try:
-                answer = doh.resolve(query)
+                answer = dnscache.resolve(query)
             except Exception as exc:  # noqa: BLE001 - fail-closed
                 log.warning("[FAILED]    TCP  %s  -> DoH error: %s; closing", desc, exc)
                 return  # closing the socket = fail-closed for this query

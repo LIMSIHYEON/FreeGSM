@@ -41,6 +41,11 @@ _NETWORKSETUP_TIMEOUT = 10
 # In-memory copy of the original servers, set by install().
 _state: dict[str, list[str]] | None = None
 
+# Whether we have already warned that the primary resolver drifted off ours (a
+# VPN/scoped resolver taking over). Tracked so verify_primary_resolver() warns
+# once per transition instead of on every 10s reconcile floor.
+_primary_leak_warned = False
+
 # Serializes install()/restore() so the finally block, atexit, and any future
 # concurrent caller can't interleave and corrupt the backup state.
 _lock = threading.Lock()
@@ -100,6 +105,62 @@ def _flush_cache() -> None:
             subprocess.run(cmd, capture_output=True, check=False)
         except Exception:  # noqa: BLE001
             pass
+
+
+# --------------------------------------------------------------------------- #
+# VPN / scoped-resolver leak detection
+# --------------------------------------------------------------------------- #
+def primary_resolver() -> str | None:
+    """The system's effective primary DNS server: the first ``nameserver[0]`` in
+    ``scutil --dns`` (resolver #1, the default/unscoped path). None if it can't be
+    read. When FreeGSM is active this should be 127.0.0.1; a different value means
+    a scoped/VPN resolver has taken over the primary DNS path (a full-tunnel VPN
+    that sets DNS via configd, which ``networksetup`` can neither see nor
+    override), so some lookups may bypass DoH."""
+    try:
+        out = subprocess.run(
+            ["scutil", "--dns"],
+            capture_output=True, text=True, check=False,
+            timeout=_NETWORKSETUP_TIMEOUT,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("nameserver[0]"):
+            _, _, val = line.partition(":")
+            val = val.strip()
+            if val:
+                return val
+    return None
+
+
+def verify_primary_resolver() -> bool:
+    """Warn (once per transition) when the primary resolver isn't the local one.
+
+    Returns True if it is LOCAL_DNS_HOST, or couldn't be read (we don't cry wolf on
+    a parse failure). Returns False when another resolver -- typically a VPN's
+    scoped resolver -- owns the primary DNS path, in which case DNS may be leaking
+    past DoH. We can only warn: overriding a configd/scoped resolver needs scutil
+    surgery that risks the machine's DNS, so this surfaces the leak for the user to
+    act on (e.g. point the VPN at 127.0.0.1 or split-tunnel its DNS)."""
+    global _primary_leak_warned
+    ns = primary_resolver()
+    if ns is None:
+        return True  # unreadable -- assume fine rather than warn spuriously
+    if ns == config.LOCAL_DNS_HOST:
+        if _primary_leak_warned:
+            log.info("primary DNS resolver back to the local DoH resolver (%s).", ns)
+            _primary_leak_warned = False
+        return True
+    if not _primary_leak_warned:
+        log.warning("primary DNS resolver is %s, not the local DoH resolver (%s) -- "
+                    "a VPN or scoped resolver is handling DNS, so lookups can bypass "
+                    "DoH. networksetup cannot override a scoped/VPN resolver; point "
+                    "the VPN's DNS at 127.0.0.1 or split-tunnel it if you need DoH "
+                    "coverage there.", ns, config.LOCAL_DNS_HOST)
+        _primary_leak_warned = True
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -231,6 +292,10 @@ def _reconcile_locked() -> None:
     if changed:
         _save_backup(_state)
         _flush_cache()
+    # After repointing every service, confirm the *effective* primary resolver is
+    # still ours. A full-tunnel VPN can set DNS via configd (invisible to
+    # networksetup), silently leaking lookups past DoH; this surfaces that.
+    verify_primary_resolver()
 
 
 def restore() -> None:
@@ -241,7 +306,8 @@ def restore() -> None:
 
 
 def _restore_locked() -> None:
-    global _state
+    global _state, _primary_leak_warned
+    _primary_leak_warned = False  # fresh state for any subsequent run
 
     backup = _state
     if backup is None:

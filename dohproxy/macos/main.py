@@ -161,14 +161,16 @@ def main() -> int:
                     socks_srv.server_close()
                     socks_srv = None
                 dpi_on = False
-        # DPI-off only: optionally arm the pf plaintext-DNS kill switch so a
-        # hardcoded-DNS app can't leak to its plaintext server (fail-closed). With
-        # DPI on the tunnel already upgrades that traffic to DoH, and a pf :53
-        # block would instead break it -- so this is mutually exclusive with DPI.
-        if not dpi_on and config.BLOCK_PLAINTEXT_DNS:
-            if not pf_control.install():
-                log.warning("plaintext-DNS kill switch could not be armed; "
-                            "hardcoded-DNS apps may still leak (DoH-only).")
+        # DPI-off only: optionally arm the pf kill switch so a hardcoded-DNS app
+        # can't leak plaintext DNS, and/or so QUIC/HTTP-3 falls back to TCP
+        # (fail-closed). With DPI on the tunnel already upgrades/handles that
+        # traffic and a pf block would instead break it -- so this is mutually
+        # exclusive with DPI.
+        if not dpi_on and (config.BLOCK_PLAINTEXT_DNS or config.BLOCK_PLAINTEXT_QUIC):
+            if not pf_control.install(block_dns=config.BLOCK_PLAINTEXT_DNS,
+                                      block_quic=config.BLOCK_PLAINTEXT_QUIC):
+                log.warning("DPI-off pf kill switch could not be armed; "
+                            "plaintext DNS / QUIC may still leak (DoH-only).")
         # Monitor the default route so a network change (Wi-Fi<->Ethernet, DHCP
         # renew) re-applies the tunnel routes / re-pins the SOCKS upstream, and
         # keeps the system DNS pointed at the local resolver. Runs even DoH-only

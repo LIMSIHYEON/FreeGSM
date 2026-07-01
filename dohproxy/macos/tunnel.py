@@ -99,6 +99,23 @@ def _iface_exists(dev: str) -> bool:
     return _run(["ifconfig", dev], check=False).returncode == 0
 
 
+def _override_owners(inet6: bool) -> dict[str, str]:
+    """Map each routing-table destination to the interface (Netif) that owns it,
+    for one address family, read from ``netstat -rn``. Used to check whether our
+    default-override (/1) routes still point at the utun. Empty on any failure."""
+    fam = "inet6" if inet6 else "inet"
+    cp = _run(["netstat", "-rnf", fam], check=False)
+    owners: dict[str, str] = {}
+    if cp.returncode != 0:
+        return owners
+    for line in cp.stdout.splitlines():
+        fields = line.split()
+        # macOS `netstat -rn` columns: Destination Gateway Flags Netif [Expire].
+        if len(fields) >= 4 and fields[3] and not fields[0].startswith("Destination"):
+            owners.setdefault(fields[0], fields[3])
+    return owners
+
+
 # --------------------------------------------------------------------------- #
 # Crash-recovery state (pid + routes), persisted across runs
 # --------------------------------------------------------------------------- #
@@ -426,6 +443,28 @@ class Tunnel:
         """Last-applied (gw, iface, gw6, iface6); the monitor compares this to
         the live default route to decide whether to reapply."""
         return self._gw, self._iface, self._gw6, self._iface6
+
+    def device_routes_intact(self) -> list[str]:
+        """Return the default-override prefixes that no longer point at our utun
+        (empty when all intact). A VPN that uses the same 0/1 + 128/1 (or ::/1 +
+        8000::/1) default-override trick can silently steal these routes, which
+        routes app traffic straight out and bypasses the SNI splitter. We report
+        rather than fight: re-adding the routes would start a flapping war with the
+        VPN and risk blackholing traffic, so the monitor just warns the user."""
+        stolen: list[str] = []
+        v4 = _override_owners(inet6=False)
+        for label, variants in (("0/1", ("0/1", "0.0.0.0/1")),
+                                ("128/1", ("128/1", "128.0.0.0/1"))):
+            owner = next((v4[v] for v in variants if v in v4), None)
+            if owner is not None and owner != self._dev:
+                stolen.append(f"{label} -> {owner}")
+        if self._v6_up:
+            v6 = _override_owners(inet6=True)
+            for label in ("::/1", "8000::/1"):
+                owner = v6.get(label)
+                if owner is not None and owner != self._dev:
+                    stolen.append(f"{label} -> {owner}")
+        return stolen
 
     def stop(self) -> None:
         # Delete routes first (reverse order), so traffic falls back to the real

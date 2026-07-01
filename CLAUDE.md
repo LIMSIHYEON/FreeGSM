@@ -20,7 +20,8 @@ Two independent jobs, both driven by a single **WinDivert** capture loop:
 | `main.py` | Entry: admin check → start DoH client → **probe upstream (refuse to start if unreachable)** → start TCP/HTTPS servers → run capture loop in a daemon thread, Ctrl+C to stop. |
 | `config.py` | All tunables + builds the WinDivert `DIVERT_FILTER` string. Read this first to understand the capture filter. |
 | `divert.py` | `Diverter`: the one WinDivert handle. `recv()` → `_dispatch()` classifies each packet and routes to a handler. Thread-safe injection via `_send` (a lock). |
-| `doh.py` | DoH client (shared `httpx.Client`, HTTP/2, kept-alive). `resolve(query)->bytes`, `probe()`. Raises on failure so callers can fail-closed. |
+| `doh.py` | DoH client (shared `httpx.Client`, HTTP/2, kept-alive). `resolve(query)->bytes`, `probe()`. Raises on failure so callers can fail-closed. Stateless (no DNS parsing). |
+| `dnscache.py` | Optional TTL-aware cache in front of `doh.resolve` (`resolve(query)->bytes`). Keyed on the question (qname/qtype/qclass + EDNS DO bit); a hit rewrites the txn ID + 0x20 case and decrements every RR TTL. Any parse anomaly falls through to an un-cached `doh.resolve`, so fail-closed is intact. **Cross-platform**: the macOS resolver + SOCKS UDP/53 path AND the Windows `udp_handler`/`tcp_proxy` handlers all call `dnscache.resolve`. Toggle: `FREEGSM_DNS_CACHE`. |
 | `udp_handler.py` | UDP/53: runs on a **thread pool** (blocking DoH round-trip). Mutates the captured packet in place into its reply and injects inbound. |
 | `tcp_proxy.py` | TCP/53: WinDivert redirect to a local DoH-terminating server (`socketserver`). Packet rewriting is **inline on the capture thread**. |
 | `https_proxy.py` | TCP/443 SNI relay: same redirect trick; terminates the connection, fragments the ClientHello via `dpi.split_hello`, then dumb bidirectional pipe. |
@@ -100,6 +101,13 @@ No test suite or linter is configured.
 - `FREEGSM_BLOCK_PLAINTEXT_DNS=1` (macOS, default off) — DPI-off fail-closed:
   drops outbound UDP/TCP :53 to non-loopback via pf so a hardcoded-DNS app can't
   leak plaintext. No-op when DPI is on (the tunnel upgrades that traffic instead).
+- `FREEGSM_BLOCK_PLAINTEXT_QUIC=1` (macOS, default off) — DPI-off only: pf drops
+  outbound UDP/443 (QUIC/HTTP-3) to non-loopback so HTTP/3 falls back to TCP/443.
+  TCP/443 is never blocked. Shares `pf_control` with the DNS block; no-op with DPI
+  on (SOCKS already drops QUIC). Doesn't hide SNI DPI-off — forces TCP / fail-closed.
+- `FREEGSM_DNS_CACHE=0` (default **on**, both ports) — disable the TTL-aware DNS
+  cache (`dnscache.py`). `FREEGSM_DNS_CACHE_MAX` (4096 entries),
+  `FREEGSM_DNS_CACHE_MAX_TTL` (86400s) bound it.
 
 ## Tests
 
@@ -109,18 +117,30 @@ python -m unittest discover -s tests -v
 ```
 
 `tests/` covers the macOS port's pure/parsing logic (DPI split, DNS utils,
-config) and the systemy modules whose shell-outs are faked: `tunnel` IPv6
-device-redirect lifecycle, `pf_control` kill switch, `netmonitor` route-change
-trigger, `dns_control` parsing. Tests that import `socks_proxy`/`netmonitor` pull
-in `httpx` and **skip** if it's absent — run in the project venv to exercise
-them. No linter is configured.
+config, `dnscache` TTL/keying/eviction) and the systemy modules whose shell-outs
+are faked: `tunnel` IPv6 device-redirect lifecycle + device-route hijack detection,
+`pf_control` kill switch (DNS + QUIC rules), `netmonitor` route-change trigger +
+route-socket loop + hijack warn-once, `dns_control` parsing, and `test_vpn`
+(primary-resolver leak detection + device-route hijack). Tests that import
+`socks_proxy`/`netmonitor` pull in `httpx` and **skip** if it's absent — run in
+the project venv to exercise them. No linter is configured.
+
+**Live verification** (the parts unit tests can't reach — real utun/network):
+`./verify_macos.sh [status|doh|cache|sni|ipv6|netchange|killswitch|vpn|all]`.
+Start FreeGSM first; the script only reads state + sends `dig` probes. `killswitch`
+covers both the DNS and QUIC pf blocks; `vpn` auto-checks the primary resolver +
+default-override routes (then guides you through toggling the VPN); `netchange` is
+guided (you switch the link, it confirms the re-apply).
 
 ## Known gaps
 
-QUIC/HTTP-3 (UDP/443) is untouched — disable browser HTTP/3 if the network
-filters QUIC by SNI. No DNS cache. 443 relay pipes through userspace Python (fine
-for browsing, slow for bulk). The split assumes the whole ClientHello arrives in
-the first `recv` (true for a <16 KB hello).
+QUIC/HTTP-3 (UDP/443): DPI-on drops it (`BLOCK_QUIC`) so HTTP/3 falls back to the
+fragmented TCP path; DPI-off it's untouched by default but opt-in
+`FREEGSM_BLOCK_PLAINTEXT_QUIC=1` drops it via pf (forces TCP; doesn't hide SNI).
+443 relay pipes through userspace Python (fine for browsing, slow for bulk). The
+split assumes the whole ClientHello arrives in the first `recv` (true for a
+<16 KB hello). The DNS cache (`dnscache.py`) is now used by **both ports** (macOS
+resolver + SOCKS UDP/53, and the Windows `udp_handler`/`tcp_proxy`).
 
 **macOS DoH coverage differs from Windows.** Windows captures *all* outbound
 UDP/53 + TCP/53 regardless of destination, so apps with a hardcoded DNS server
@@ -135,7 +155,18 @@ on, hardcoded-DNS apps are covered. **DPI-off** (DoH-only, no tunnel) can't
 *upgrade* hardcoded DNS (pf `rdr` can't catch locally-originated traffic), but
 opt-in `FREEGSM_BLOCK_PLAINTEXT_DNS=1` (`macos/pf_control.py`) *fail-closes* it: a
 pf rule drops outbound :53 to non-loopback so the query is dropped, not leaked.
-Off by default (it can break apps that need a specific external DNS server).
+Off by default (it can break apps that need a specific external DNS server). The
+same module optionally drops UDP/443 (`FREEGSM_BLOCK_PLAINTEXT_QUIC=1`) DPI-off.
+
+**macOS VPN coexistence.** A full-tunnel VPN can silently defeat FreeGSM two ways;
+`netmonitor` now *detects and warns* on each (it doesn't auto-fight — battling a
+VPN's routes/resolver risks bricking DNS): (1) a VPN setting DNS via configd
+(invisible to `networksetup`) makes the effective primary resolver stop being
+`127.0.0.1` — `dns_control.verify_primary_resolver` (via `scutil --dns`, run from
+`reconcile`) warns that lookups may bypass DoH; (2) a VPN using the same
+`0/1`+`128/1` default-override trick steals our device routes — `tunnel.device_routes_intact`
+(via `netstat -rn`) reports it and the monitor warns the SNI splitter is bypassed.
+`./verify_macos.sh vpn` surfaces both.
 
 **macOS IPv6.** When the host has an IPv6 default route, the tunnel redirects
 IPv6 too (`::/1` + `8000::/1` → utun, plus a v6 ifscope default and v6 DoH
@@ -143,12 +174,16 @@ host-route), so IPv6 HTTPS gets the same SNI fragmentation. Disable with
 `FREEGSM_TUNNEL_IPV6=0`. IPv6 acquired *mid-session* (e.g. a VPN coming up after
 start) is now brought up by `netmonitor` without a restart: `tunnel.reapply_routes`
 calls `_enable_v6_device` (utun v6 addr + `::/1`/`8000::/1` device routes) when a
-v6 default appears and `_disable_v6_device` when it's lost. The poll interval
-(`FREEGSM_MONITOR_INTERVAL`, 10s) bounds the delay.
+v6 default appears and `_disable_v6_device` when it's lost.
 
-**macOS network-change handling.** `macos/netmonitor.py` polls the default route
-(`FREEGSM_MONITOR_INTERVAL`, default 10s) and, on a change (Wi-Fi↔Ethernet, DHCP
-renew), re-applies the tunnel's ifscope/DoH-exclude routes, re-pins the SOCKS
-upstream (`socks_proxy.set_bound_iface`), and re-asserts the local resolver
-across services (`dns_control.reconcile`). Teardown stops the monitor FIRST so it
-can't re-add what teardown is removing.
+**macOS network-change handling.** `macos/netmonitor.py` is **event-driven**: it
+reads the kernel `PF_ROUTE` socket (`AF_ROUTE`) and reconciles within a fraction
+of a second of a route add/change/delete, with `FREEGSM_MONITOR_INTERVAL`
+(default 10s) only as a *floor* that catches drift a route message can't signal
+(e.g. a DHCP renew that changes only a service's DNS). If the routing socket
+can't be opened it degrades to pure interval polling. On a change (Wi-Fi↔Ethernet,
+DHCP renew) it re-applies the tunnel's ifscope/DoH-exclude routes, re-pins the
+SOCKS upstream (`socks_proxy.set_bound_iface`), brings the v6 device redirect
+up/down to match, and re-asserts the local resolver across services
+(`dns_control.reconcile`). `stop()` wakes the `select()` via a self-pipe; teardown
+stops the monitor FIRST so it can't re-add what teardown is removing.

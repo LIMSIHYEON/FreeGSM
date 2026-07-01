@@ -1,4 +1,4 @@
-"""pf-based plaintext-DNS kill switch for the macOS port (DPI-off only).
+"""pf-based DPI-off kill switch for the macOS port (plaintext DNS + QUIC).
 
 The macOS DoH coverage has one residual gap versus Windows. Windows captures
 *all* outbound UDP/53 + TCP/53 regardless of destination, so an app with a
@@ -18,11 +18,19 @@ strictly better than a leaked one). The hardcoded-DNS app loses that DNS path
 rather than leaking it; well-behaved apps then fall back to the system resolver
 (127.0.0.1 -> DoH).
 
-Because dropping can break an app that *only* ever uses a specific external DNS
-(some VPN clients, split-horizon corporate DNS, Tailscale's 100.100.100.100),
-this is **opt-in** (FREEGSM_BLOCK_PLAINTEXT_DNS, default off) and only takes
-effect when DPI is off (with DPI on the tunnel already upgrades the same traffic,
-and a pf block would instead break that upgrade by dropping UDP/53 inside utun).
+The same lever covers a second DPI-off gap: QUIC/HTTP-3 (UDP/443). With DPI on the
+SOCKS proxy drops it so HTTP/3 falls back to the SNI-fragmented TCP path; DPI-off
+there is no splitter, so an optional UDP/443 drop at least forces HTTP/3 apps back
+to plain TCP/443 (useful where QUIC is blocked/throttled wholesale) and keeps the
+fail-closed posture. TCP/443 is never dropped -- that would kill all HTTPS -- and
+the DoH channel rides TCP, so neither block touches it.
+
+Both blocks are **opt-in** (FREEGSM_BLOCK_PLAINTEXT_DNS / _QUIC, default off) and
+only take effect when DPI is off. Dropping plaintext DNS can break an app that
+*only* ever uses a specific external DNS (some VPN clients, split-horizon
+corporate DNS, Tailscale's 100.100.100.100); with DPI on the tunnel already
+upgrades the same traffic and a pf block would instead break that upgrade by
+dropping UDP/53 inside utun.
 
 Lifecycle (mirrors dns_control / tunnel): the original pf ruleset is restored
 from /etc/pf.conf and pf's enabled state is restored via the ``-E``/``-X``
@@ -58,31 +66,46 @@ _active = False
 _token: str | None = None
 
 
-def build_ruleset() -> str:
-    """The pf main ruleset we load: re-declare Apple's anchors (so system
-    features like Internet Sharing keep working) then drop plaintext DNS to any
-    non-loopback destination, for both address families.
+def build_ruleset(block_dns: bool = True, block_quic: bool = False) -> str:
+    """The pf main ruleset we load: re-declare Apple's anchors (so system features
+    like Internet Sharing keep working) then, per the requested blocks, drop
+    plaintext DNS and/or QUIC to any non-loopback destination, for both families.
+
+    ``block_dns`` drops outbound :53 (UDP+TCP) -- the plaintext-DNS kill switch.
+    ``block_quic`` drops outbound UDP :443 (QUIC/HTTP-3) so HTTP/3 falls back to
+    TCP/443; TCP :443 is deliberately NOT blocked (that would kill all HTTPS).
 
     pf evaluates by rule class, so the translation anchors (nat/rdr) must precede
     our filter (block) rules. ``quick`` makes the drop take effect on first match
     regardless of any later (default-pass) behaviour. Loopback is excluded so the
     local resolver on 127.0.0.1:53 -- and any user-run local resolver -- is never
-    blocked; the DoH channel itself rides :443, never :53, so it is unaffected."""
-    return (
-        "# FreeGSM plaintext-DNS kill switch (DPI-off, fail-closed). Auto-generated;\n"
-        "# removed and pf restored from /etc/pf.conf when FreeGSM stops.\n"
-        'scrub-anchor "com.apple/*"\n'
-        'nat-anchor "com.apple/*"\n'
-        'rdr-anchor "com.apple/*"\n'
-        'dummynet-anchor "com.apple/*"\n'
-        'anchor "com.apple/*"\n'
-        'load anchor "com.apple" from "/etc/pf.anchors/com.apple"\n'
-        "\n"
-        "block drop out quick proto udp from any to !127.0.0.0/8 port = 53\n"
-        "block drop out quick proto tcp from any to !127.0.0.0/8 port = 53\n"
-        "block drop out quick proto udp from any to !::1 port = 53\n"
-        "block drop out quick proto tcp from any to !::1 port = 53\n"
-    )
+    blocked; the DoH channel itself rides TCP :443 (HTTP/2), never UDP or :53, so
+    it is unaffected by either block."""
+    rules = [
+        "# FreeGSM DPI-off kill switch (fail-closed). Auto-generated; removed and",
+        "# pf restored from /etc/pf.conf when FreeGSM stops.",
+        'scrub-anchor "com.apple/*"',
+        'nat-anchor "com.apple/*"',
+        'rdr-anchor "com.apple/*"',
+        'dummynet-anchor "com.apple/*"',
+        'anchor "com.apple/*"',
+        'load anchor "com.apple" from "/etc/pf.anchors/com.apple"',
+        "",
+    ]
+    if block_dns:
+        rules += [
+            "block drop out quick proto udp from any to !127.0.0.0/8 port = 53",
+            "block drop out quick proto tcp from any to !127.0.0.0/8 port = 53",
+            "block drop out quick proto udp from any to !::1 port = 53",
+            "block drop out quick proto tcp from any to !::1 port = 53",
+        ]
+    if block_quic:
+        # UDP/443 only -- blocking TCP/443 would take down all HTTPS.
+        rules += [
+            "block drop out quick proto udp from any to !127.0.0.0/8 port = 443",
+            "block drop out quick proto udp from any to !::1 port = 443",
+        ]
+    return "\n".join(rules) + "\n"
 
 
 def _run(args: list[str]) -> subprocess.CompletedProcess:
@@ -126,21 +149,24 @@ def _reconcile_leftover() -> None:
     _clear_marker()
 
 
-def install() -> bool:
-    """Load the kill-switch ruleset and enable pf (reference-counted). Returns
-    True if the block is now active, False if it could not be set up (in which
-    case nothing is left changed). Safe to call once; idempotent via ``_active``."""
+def install(block_dns: bool = True, block_quic: bool = False) -> bool:
+    """Load the kill-switch ruleset and enable pf (reference-counted). ``block_dns``
+    drops plaintext :53, ``block_quic`` drops UDP/443 (QUIC). Returns True if the
+    block is now active, False if it could not be set up (in which case nothing is
+    left changed) or if neither block was requested. Idempotent via ``_active``."""
     global _active, _token
     if _active:
         return True
+    if not (block_dns or block_quic):
+        return False  # nothing to arm
 
     _reconcile_leftover()
 
     try:
         _STATE_DIR.mkdir(parents=True, exist_ok=True)
-        RULES_FILE.write_text(build_ruleset(), encoding="utf-8")
+        RULES_FILE.write_text(build_ruleset(block_dns, block_quic), encoding="utf-8")
     except OSError as exc:
-        log.error("could not write pf ruleset (%s); plaintext-DNS block not active.", exc)
+        log.error("could not write pf ruleset (%s); DPI-off kill switch not active.", exc)
         return False
 
     load = _run(["-f", str(RULES_FILE)])
@@ -162,8 +188,14 @@ def install() -> bool:
     _token = _parse_token(enable.stderr)
     _active = True
     _write_marker()
-    log.info("plaintext-DNS kill switch active (pf): UDP/TCP :53 to non-loopback "
-             "is dropped (fail-closed). DPI is off, so hardcoded-DNS apps can't leak.")
+    blocked = []
+    if block_dns:
+        blocked.append("UDP/TCP :53 (plaintext DNS)")
+    if block_quic:
+        blocked.append("UDP :443 (QUIC/HTTP-3)")
+    log.info("DPI-off kill switch active (pf): %s to non-loopback dropped "
+             "(fail-closed). DPI is off, so this traffic can't leak.",
+             " + ".join(blocked))
     return True
 
 
