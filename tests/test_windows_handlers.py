@@ -23,6 +23,8 @@ module is skipped.
 
 from __future__ import annotations
 
+import socket
+import struct
 import unittest
 from unittest import mock
 
@@ -66,6 +68,30 @@ class Sender:
 
     def __call__(self, packet) -> None:
         self.sent.append(packet)
+
+
+class _LocalSock:
+    """Wraps a socketpair end so getsockname() looks like an AF_INET address,
+    letting the DoH server's open-resolver guard (which compares client_address[0]
+    to getsockname()[0]) run against a socketpair that has no real IP."""
+
+    def __init__(self, sock, ip: str = "127.0.0.1") -> None:
+        self._s = sock
+        self._ip = ip
+
+    def getsockname(self):
+        return (self._ip, 0)
+
+    def recv(self, n):
+        return self._s.recv(n)
+
+    def sendall(self, data):
+        return self._s.sendall(data)
+
+
+def _framed(query: bytes) -> bytes:
+    """DNS-over-TCP framing: a 2-byte big-endian length prefix + the message."""
+    return struct.pack("!H", len(query)) + query
 
 
 # --------------------------------------------------------------------------- #
@@ -227,6 +253,72 @@ class HttpsProxyTest(unittest.TestCase):
         https_proxy.handle_packet(pkt, send)
         self.assertEqual(send.sent, [pkt])
         self.assertIsNone(pkt.direction)
+
+
+# --------------------------------------------------------------------------- #
+# TCP/53 -- the DoH-terminating local server (tcp_proxy._Handler)
+# --------------------------------------------------------------------------- #
+@unittest.skipIf(udp_handler is None, "pydivert not importable here")
+class TcpDohServerTest(unittest.TestCase):
+    """The local DoH-terminating TCP server: 2-byte length-prefixed framing, a
+    DoH round-trip per query, fail-closed (close, never leak) on a DoH error, and
+    the open-resolver guard that only serves the host itself."""
+
+    def _serve(self, feed: bytes, resolve, *, client_ip="127.0.0.1",
+               host_ip="127.0.0.1") -> bytes:
+        srv, cli = socket.socketpair()
+        self.addCleanup(lambda: [s.close() for s in (srv, cli)])
+        handler = object.__new__(tcp_proxy._Handler)
+        handler.request = _LocalSock(srv, host_ip)
+        handler.client_address = (client_ip, 0)
+        # Feed all input then half-close: the handler drains the queries and the
+        # next framing read hits EOF, so handle() returns without a thread.
+        cli.sendall(feed)
+        cli.shutdown(socket.SHUT_WR)
+        with mock.patch.object(tcp_proxy.dnscache, "resolve", resolve):
+            handler.handle()
+        try:
+            srv.shutdown(socket.SHUT_WR)  # let the reader below see EOF
+        except OSError:
+            pass
+        out = bytearray()
+        while True:
+            chunk = cli.recv(65535)
+            if not chunk:
+                break
+            out += chunk
+        return bytes(out)
+
+    def test_query_is_resolved_and_answer_is_framed(self):
+        answer = b"\x12\x34 the answer"
+        got = self._serve(_framed(b"query-one"), mock.Mock(return_value=answer))
+        self.assertEqual(got, _framed(answer))
+
+    def test_two_queries_on_one_connection(self):
+        resolve = mock.Mock(side_effect=[b"AAA", b"BBBB"])
+        got = self._serve(_framed(b"q1") + _framed(b"q2"), resolve)
+        self.assertEqual(got, _framed(b"AAA") + _framed(b"BBBB"))
+        self.assertEqual(resolve.call_count, 2)
+
+    def test_fail_closed_sends_nothing_on_doh_error(self):
+        resolve = mock.Mock(side_effect=RuntimeError("DoH down"))
+        got = self._serve(_framed(b"query"), resolve)
+        self.assertEqual(got, b"", "a DoH failure must close, never leak a reply")
+
+    def test_truncated_query_body_is_dropped(self):
+        # Header claims 100 body bytes but only 4 arrive before EOF.
+        resolve = mock.Mock()
+        got = self._serve(struct.pack("!H", 100) + b"abcd", resolve)
+        self.assertEqual(got, b"")
+        resolve.assert_not_called()
+
+    def test_open_resolver_guard_rejects_foreign_peer(self):
+        # peer IP != the socket's own IP -> refuse, so we never act as an open
+        # resolver for a real external client.
+        resolve = mock.Mock(return_value=b"x")
+        got = self._serve(_framed(b"q"), resolve, client_ip="8.8.8.8")
+        self.assertEqual(got, b"")
+        resolve.assert_not_called()
 
 
 if __name__ == "__main__":

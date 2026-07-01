@@ -27,7 +27,7 @@ import threading
 
 from pydivert.consts import Direction
 
-from . import config, dnscache
+from . import config, dnscache, netutil
 from .dnsutil import describe_query
 
 log = logging.getLogger("dohproxy.tcp")
@@ -81,16 +81,6 @@ def _rewrite_reply(packet, send) -> None:
 # --------------------------------------------------------------------------- #
 # Local DoH-terminating TCP server
 # --------------------------------------------------------------------------- #
-def _recv_exactly(sock, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            return bytes(buf)
-        buf.extend(chunk)
-    return bytes(buf)
-
-
 class _Handler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         sock = self.request
@@ -101,11 +91,11 @@ class _Handler(socketserver.BaseRequestHandler):
             return
 
         while True:
-            header = _recv_exactly(sock, 2)
+            header = netutil.recv_exactly(sock, 2)
             if len(header) < 2:
                 return
             (length,) = struct.unpack("!H", header)
-            query = _recv_exactly(sock, length)
+            query = netutil.recv_exactly(sock, length)
             if len(query) < length:
                 return
 

@@ -135,8 +135,10 @@ leak). Tests that import `socks_proxy`/`resolver`/`netmonitor`/`dnscache` pull i
 
 The **Windows** WinDivert path is covered too. `test_windows_handlers`:
 `udp_handler` in-place query→reply swap + INBOUND inject + fail-closed/`FAIL_OPEN`,
-and `tcp_proxy`/`https_proxy` redirect-to-relay-port + reply-src-rewrite + RST/FIN
-`_conn_map` cleanup + unknown-reply drop. `test_divert_dispatch`: `Diverter._dispatch`
+`tcp_proxy`/`https_proxy` redirect-to-relay-port + reply-src-rewrite + RST/FIN
+`_conn_map` cleanup + unknown-reply drop, and the `tcp_proxy._Handler` DoH-over-TCP
+server (length-prefixed framing, multi-query reuse, fail-closed on DoH error,
+truncated-body drop, open-resolver guard) driven over a socketpair. `test_divert_dispatch`: `Diverter._dispatch`
 routing (UDP/53→pool, outbound :443 / relay-reply→HTTPS relay only when `DPI_BYPASS`,
 other TCP→DNS proxy, else pass-through) via a bare `__new__` Diverter with a
 synchronous stand-in pool. pydivert is pure-Python (the WinDivert kernel driver
