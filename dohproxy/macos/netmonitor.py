@@ -71,6 +71,10 @@ class NetworkMonitor:
         # Whether we have already warned that our default-override routes were
         # hijacked (a VPN taking over the default). Warn once per transition.
         self._device_warned = False
+        # Whether we have already warned about the REVERSE conflict: a full-tunnel
+        # VPN is up but FreeGSM's /1 overrides shadow it, so app TCP bypasses the
+        # VPN and leaks the real IP. Warn once per transition.
+        self._reverse_vpn_warned = False
 
     def start(self) -> None:
         self._wake_r, self._wake_w = os.pipe()
@@ -149,6 +153,11 @@ class NetworkMonitor:
         self._check_device_routes()
 
         gw, iface = tunnel.default_route()
+        # The mirror image of the hijack above: a full-tunnel VPN is up but OUR
+        # /1 overrides win, so app TCP exits the physical link and bypasses the
+        # VPN (the real IP leaks). Detected as a gateway-less default via a
+        # foreign utun; warn once so a user running the VPN for anonymity knows.
+        self._check_reverse_vpn_bypass(gw, iface)
         if not gw or not iface:
             # Link is momentarily down. macOS flushes the interface-scoped routes
             # (our ifscope default + the DoH host-route) along with the interface,
@@ -195,6 +204,40 @@ class NetworkMonitor:
             log.info("default-override routes back on the tunnel; SNI fragmentation "
                      "restored.")
             self._device_warned = False
+
+    def _check_reverse_vpn_bypass(self, gw: str | None, iface: str | None) -> None:
+        """Warn once when FreeGSM is silently defeating a full-tunnel VPN.
+
+        A full-tunnel VPN installs a gateway-less default via its own utun. Our
+        /1 default-override routes are more specific, so they shadow it, and the
+        SOCKS upstream stays pinned to the PHYSICAL link (chasing the VPN's
+        gateway-less utun would loop). App TCP therefore exits the real link,
+        bypassing the VPN and exposing the real IP -- SNI is still fragmented, but
+        a VPN run for anonymity is defeated. We can't safely fight it (see the
+        module docstring / CLAUDE.md), so surface it once per transition.
+
+        Signature: a gateway-less default route (``gw is None``) whose interface
+        is a foreign tunnel (``utun``/``ipsec``, not our own TUN_DEVICE). A real
+        gateway, or a genuine link-down (``iface is None``), is not a bypass."""
+        bypassing = (
+            gw is None
+            and iface is not None
+            and iface != config.TUN_DEVICE
+            and iface.startswith(("utun", "ipsec"))
+        )
+        if bypassing and not self._reverse_vpn_warned:
+            log.warning(
+                "a full-tunnel VPN is up (gateway-less default via %s) but "
+                "FreeGSM's default-override routes shadow it and the SOCKS "
+                "upstream stays pinned to the physical link, so app TCP BYPASSES "
+                "the VPN and your real IP is exposed (SNI is still fragmented). "
+                "Disable FreeGSM's DPI to let the VPN carry traffic, or stop the "
+                "VPN if you want FreeGSM's path.", iface)
+            self._reverse_vpn_warned = True
+        elif not bypassing and self._reverse_vpn_warned:
+            log.info("full-tunnel VPN no longer shadowed by FreeGSM; "
+                     "reverse-bypass condition cleared.")
+            self._reverse_vpn_warned = False
 
     def stop(self) -> None:
         self._stop.set()

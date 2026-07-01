@@ -125,7 +125,9 @@ non-TLS / non-443 traffic stays byte-identical)
 and the systemy modules whose shell-outs / sockets are faked: `tunnel` IPv6
 device-redirect lifecycle + device-route hijack detection, `pf_control` kill
 switch (DNS + QUIC rules), `netmonitor` route-change trigger + route-socket loop
-+ hijack warn-once, `dns_control` parsing, `test_vpn` (primary-resolver leak
++ hijack warn-once + reverse-VPN-bypass warn-once (gateway-less foreign-utun
+default → warn; genuine link-down / our own utun → silent), `dns_control` parsing,
+`test_vpn` (primary-resolver leak
 detection + device-route hijack), `resolver` (UDP/TCP loopback DNS: fail-closed,
 TC-truncation, length-prefixed framing — DoH faked at `dnscache.resolve`), and
 `socks_proxy` (`_parse_dst`, iface pin/detect `set_bound_iface`/`physical_iface`,
@@ -198,15 +200,20 @@ VPN's routes/resolver risks bricking DNS): (1) a VPN setting DNS via configd
 (via `netstat -rn`) reports it and the monitor warns the SNI splitter is bypassed.
 `./verify_macos.sh vpn` surfaces both.
 
-The **reverse** also happens and is *not* warned: with DPI on, FreeGSM's own
-`0/1`+`128/1` are more specific than a VPN's `0/0` default, so they shadow it, and
-the SOCKS upstream is pinned to the *physical* iface (`IP_BOUND_IF`) — so app TCP
-exits via the real link, **bypassing the VPN tunnel and exposing the real IP**
-(SNI is still fragmented; a full-tunnel VPN run for anonymity is silently
-defeated). `netmonitor` treats a gateway-less VPN default (`route get default` →
-`via utunN` with no gateway) as "link down" and keeps the SOCKS pin on the
-physical iface rather than chasing the VPN's utun (which would loop / has no usable
-scoped gateway), so this is the intended route-war outcome, not a re-pin bug.
+The **reverse** also happens and is now *warned* (was previously silent): with DPI
+on, FreeGSM's own `0/1`+`128/1` are more specific than a VPN's `0/0` default, so
+they shadow it, and the SOCKS upstream is pinned to the *physical* iface
+(`IP_BOUND_IF`) — so app TCP exits via the real link, **bypassing the VPN tunnel
+and exposing the real IP** (SNI is still fragmented; a full-tunnel VPN run for
+anonymity is silently defeated). `netmonitor` treats a gateway-less VPN default
+(`route get default` → `via utunN` with no gateway) as "link down" and keeps the
+SOCKS pin on the physical iface rather than chasing the VPN's utun (which would
+loop / has no usable scoped gateway), so this is the intended route-war outcome,
+not a re-pin bug. It doesn't auto-fight the conflict (that risks bricking DNS),
+but `netmonitor._check_reverse_vpn_bypass` now *warns once per transition* when it
+sees that gateway-less foreign-utun default (a genuine link-down — no default at
+all — or our own `TUN_DEVICE` utun is excluded, so it never cries wolf on
+itself), so a user running the VPN for anonymity learns their real IP is exposed.
 Running two full-tunnel tools at once is the fundamental conflict; FreeGSM does not
 fight it. Confirmed live (ProtonVPN + DPI on): traffic kept exiting `en0`.
 

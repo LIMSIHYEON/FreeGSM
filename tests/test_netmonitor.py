@@ -121,6 +121,53 @@ class NetMonitorTest(unittest.TestCase):
             mon._tick()
             self.assertFalse(mon._device_warned)
 
+    def test_reverse_vpn_bypass_warns_once_then_clears(self):
+        # A full-tunnel VPN is up: route get default -> gateway-less via a foreign
+        # utun. Our /1 overrides shadow it and the SOCKS pin stays on the physical
+        # link, so app TCP bypasses the VPN (real IP leaks). Warn once; recover
+        # when a real gateway returns.
+        tun = _FakeTun(gw="10.0.0.1", iface="en0")
+        mon = netmonitor.NetworkMonitor(tun)
+        with mock.patch.object(netmonitor.config, "TUNNEL_IPV6", False):
+            self._patch_routes((None, "utun4"), (None, None))
+            with self.assertLogs("dohproxy.macos.monitor", level="WARNING") as cm:
+                mon._tick()
+            self.assertTrue(any("BYPASSES the VPN" in m for m in cm.output))
+            self.assertTrue(mon._reverse_vpn_warned)
+            self.assertEqual(tun.reapplied, [])  # gateway-less -> no reapply
+            # Still bypassing next tick: no duplicate warning.
+            with mock.patch.object(netmonitor.log, "warning") as warn:
+                mon._tick()
+                warn.assert_not_called()
+            # VPN gone, real gateway back: flag clears and traffic reapplies.
+            self._patch_routes(("10.0.0.1", "en0"), (None, None))
+            mon._tick()
+            self.assertFalse(mon._reverse_vpn_warned)
+
+    def test_genuine_link_down_is_not_a_reverse_bypass(self):
+        # No default route at all (iface is None) is a link-down, not a VPN
+        # shadowing us -- it must NOT trip the reverse-bypass warning.
+        tun = _FakeTun(gw="10.0.0.1", iface="en0")
+        mon = netmonitor.NetworkMonitor(tun)
+        with mock.patch.object(netmonitor.config, "TUNNEL_IPV6", False):
+            self._patch_routes((None, None), (None, None))
+            with mock.patch.object(netmonitor.log, "warning") as warn:
+                mon._tick()
+                warn.assert_not_called()
+        self.assertFalse(mon._reverse_vpn_warned)
+
+    def test_our_own_utun_default_is_not_a_reverse_bypass(self):
+        # A gateway-less default via OUR OWN tunnel device is us, not a foreign
+        # VPN -- excluded so we never warn about ourselves.
+        tun = _FakeTun(gw="10.0.0.1", iface="en0")
+        mon = netmonitor.NetworkMonitor(tun)
+        with mock.patch.object(netmonitor.config, "TUNNEL_IPV6", False):
+            self._patch_routes((None, netmonitor.config.TUN_DEVICE), (None, None))
+            with mock.patch.object(netmonitor.log, "warning") as warn:
+                mon._tick()
+                warn.assert_not_called()
+        self.assertFalse(mon._reverse_vpn_warned)
+
 
 @unittest.skipIf(netmonitor is None, "netmonitor (httpx) not importable here")
 class NetMonitorLoopTest(unittest.TestCase):

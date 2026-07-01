@@ -331,6 +331,23 @@ cmd_vpn() {
   else
     skip "tunnel not up (DPI off): no default override to check"
   fi
+  # Auto-check 3: the REVERSE conflict -- is FreeGSM shadowing a full-tunnel VPN?
+  # A gateway-less default via a FOREIGN utun means a VPN is up but our /1
+  # overrides win, so app TCP exits the physical link and BYPASSES the VPN (real
+  # IP exposed). Mirrors netmonitor._check_reverse_vpn_bypass.
+  if tunnel_up; then
+    local droute dgw diface foreign_tun=0
+    droute=$(route -n get default 2>/dev/null || true)
+    dgw=$(printf '%s\n' "$droute" | awk '/gateway:/{print $2; exit}')
+    diface=$(printf '%s\n' "$droute" | awk '/interface:/{print $2; exit}')
+    case "$diface" in utun*|ipsec*) foreign_tun=1 ;; esac
+    if [ -z "$dgw" ] && [ -n "$diface" ] && [ "$diface" != "$TUN_DEV" ] && [ "$foreign_tun" = 1 ]; then
+      fail "default is gateway-less via $diface (a full-tunnel VPN) but FreeGSM's /1 overrides shadow it -- app TCP BYPASSES the VPN and your real IP is exposed (SNI still fragmented)"
+      info "disable FreeGSM's DPI to let the VPN carry traffic, or stop the VPN if you want FreeGSM's path"
+    else
+      pass "FreeGSM is not shadowing a full-tunnel VPN (default via ${diface:-<none>}${dgw:+, gw $dgw})"
+    fi
+  fi
   # Guided steps for the parts that need you to toggle the VPN.
   printf "\n%sGuided%s: to exercise the mid-session transitions:\n" "$C_B" "$C_0"
   info "  1. With FreeGSM running, connect your VPN, then re-run: ./verify_macos.sh vpn status ipv6"
