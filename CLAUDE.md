@@ -201,4 +201,11 @@ DHCP renew) it re-applies the tunnel's ifscope/DoH-exclude routes, re-pins the
 SOCKS upstream (`socks_proxy.set_bound_iface`), brings the v6 device redirect
 up/down to match, and re-asserts the local resolver across services
 (`dns_control.reconcile`). `stop()` wakes the `select()` via a self-pipe; teardown
-stops the monitor FIRST so it can't re-add what teardown is removing.
+stops the monitor FIRST so it can't re-add what teardown is removing. A **link
+bounce back to the same gateway** (Wi-Fi off→on on the same network) still flushes
+the interface-scoped routes with the interface, so `_tick` forgets the last-applied
+route whenever the default drops to none — otherwise the unchanged gateway on
+recovery would read as "nothing moved" and the flushed ifscope route would never be
+rebuilt, leaving the SOCKS upstream `ENETUNREACH` (only cached DNS answering) until
+a restart. `verify_macos.sh netchange` forces a fresh through-tunnel HTTPS fetch to
+catch exactly this (a cached DNS lookup passes even when the data plane is broken).

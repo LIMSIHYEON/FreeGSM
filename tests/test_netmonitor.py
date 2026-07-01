@@ -75,12 +75,31 @@ class NetMonitorTest(unittest.TestCase):
             mon._tick()
         self.assertEqual(tun.reapplied, [])  # v6 not consulted -> nothing moved
 
-    def test_network_down_skips_reapply(self):
-        tun = _FakeTun()
+    def test_network_down_skips_reapply_but_forgets_last_route(self):
+        # Link down: no reapply this tick, but the last-applied route is cleared so
+        # the recovery is treated as a change even if it lands on the same gateway
+        # (macOS flushes our interface-scoped routes when the interface drops).
+        tun = _FakeTun(gw="10.0.0.1", iface="en0")
         mon = netmonitor.NetworkMonitor(tun)
         self._patch_routes((None, None), (None, None))
         mon._tick()
         self.assertEqual(tun.reapplied, [])
+        self.assertEqual(mon._last_v4, (None, None))
+        self.assertEqual(mon._last_v6, (None, None))
+
+    def test_link_bounce_to_same_gateway_reapplies(self):
+        # A Wi-Fi/Ethernet bounce that returns to the SAME gateway still flushes
+        # the interface-scoped routes, so the monitor must rebuild them: a down
+        # tick then an up tick (identical gateway) => exactly one reapply.
+        tun = _FakeTun(gw="10.0.0.1", iface="en0")  # seeds _last = (10.0.0.1, en0)
+        mon = netmonitor.NetworkMonitor(tun)
+        with mock.patch.object(netmonitor.config, "TUNNEL_IPV6", False):
+            self._patch_routes((None, None), (None, None))
+            mon._tick()                                   # link down
+            self.assertEqual(tun.reapplied, [])
+            self._patch_routes(("10.0.0.1", "en0"), (None, None))
+            mon._tick()                                   # link back, same gateway
+        self.assertEqual(tun.reapplied, [("10.0.0.1", "en0", None, None)])
 
     def test_device_route_hijack_warns_once_then_clears(self):
         # A VPN stole our /1 override: the gateway is unchanged (so no reapply) but

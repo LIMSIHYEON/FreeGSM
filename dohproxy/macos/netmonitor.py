@@ -150,7 +150,17 @@ class NetworkMonitor:
 
         gw, iface = tunnel.default_route()
         if not gw or not iface:
-            return  # network is momentarily down; wait for it to come back
+            # Link is momentarily down. macOS flushes the interface-scoped routes
+            # (our ifscope default + the DoH host-route) along with the interface,
+            # so forget the last-applied route: when the link returns -- even on
+            # the SAME gateway -- the next tick then sees a change and rebuilds
+            # those scoped routes. Without this, a Wi-Fi/Ethernet bounce back to
+            # the same gateway leaves the SOCKS upstream with no ifscope route
+            # (ENETUNREACH on every connect), so only cached DNS keeps answering
+            # and all new traffic breaks until a restart.
+            self._last_v4 = (None, None)
+            self._last_v6 = (None, None)
+            return  # wait for it to come back
         gw6, iface6 = (tunnel.default_route6()
                        if config.TUNNEL_IPV6 else (None, None))
 

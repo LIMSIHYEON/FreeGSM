@@ -233,13 +233,30 @@ cmd_netchange() {
   else
     fail "ifscope default for $if1 is '${sc1:-<none>}', expected $gw1 -- monitor did not re-apply (or it is mid-poll)"
   fi
-  if dig @127.0.0.1 +tries=1 +timeout=5 +short example.com >/dev/null 2>&1; then
-    pass "DNS still resolves after the switch"
+  # NB: a cached DNS name resolves from memory even when the tunnel's data plane
+  # is broken, so this alone is a weak signal -- the through-tunnel fetch below is
+  # the real test. Use a random label so it can't be a cache hit / masked.
+  if dig @127.0.0.1 +tries=1 +timeout=5 +short "verify-$$.example.com" A >/dev/null 2>&1; then
+    pass "DNS still resolves after the switch (fresh, un-cached name)"
   else
     fail "DNS broken after the switch"
   fi
-  if tunnel_up && [ "$gw0" != "$gw1" ]; then
-    info "tip: also load a fresh HTTPS site in a browser to confirm SNI fragmentation survived the switch"
+  # The bug a same-gateway link bounce can cause is that the SOCKS upstream's
+  # ifscope route gets flushed with the interface and never rebuilt, so cached DNS
+  # keeps working but every NEW connection through the tunnel fails (ENETUNREACH).
+  # Force a fresh HTTPS connection THROUGH the tunnel to catch exactly that.
+  if tunnel_up; then
+    if have curl; then
+      local code
+      code=$(curl -4 --max-time 12 -sS -o /dev/null -w '%{http_code}' https://example.com/ 2>/dev/null)
+      if [ -n "$code" ] && [ "$code" != "000" ]; then
+        pass "fresh HTTPS through the tunnel works after the switch (HTTP $code -- SOCKS upstream route intact)"
+      else
+        fail "fresh HTTPS through the tunnel FAILED after the switch -- SOCKS upstream route not restored (scoped route flushed and not rebuilt)"
+      fi
+    else
+      info "install curl to auto-check a fresh through-tunnel connection; meanwhile load a new HTTPS site in a browser"
+    fi
   fi
 }
 
