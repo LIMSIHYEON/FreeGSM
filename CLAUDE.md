@@ -117,13 +117,28 @@ python -m unittest discover -s tests -v
 ```
 
 `tests/` covers the macOS port's pure/parsing logic (DPI split, DNS utils,
-config, `dnscache` TTL/keying/eviction) and the systemy modules whose shell-outs
-are faked: `tunnel` IPv6 device-redirect lifecycle + device-route hijack detection,
-`pf_control` kill switch (DNS + QUIC rules), `netmonitor` route-change trigger +
-route-socket loop + hijack warn-once, `dns_control` parsing, and `test_vpn`
-(primary-resolver leak detection + device-route hijack). Tests that import
-`socks_proxy`/`netmonitor` pull in `httpx` and **skip** if it's absent — run in
-the project venv to exercise them. No linter is configured.
+config, `dnscache` TTL/keying/eviction, `netutil.recv_exactly` framing + `pump`)
+and the systemy modules whose shell-outs / sockets are faked: `tunnel` IPv6
+device-redirect lifecycle + device-route hijack detection, `pf_control` kill
+switch (DNS + QUIC rules), `netmonitor` route-change trigger + route-socket loop
++ hijack warn-once, `dns_control` parsing, `test_vpn` (primary-resolver leak
+detection + device-route hijack), `resolver` (UDP/TCP loopback DNS: fail-closed,
+TC-truncation, length-prefixed framing — DoH faked at `dnscache.resolve`), and
+`socks_proxy` (`_parse_dst`, iface pin/detect `set_bound_iface`/`physical_iface`,
+and the hardcoded-DNS `_dns_over_doh` path: fail-closed + truncation + no permit
+leak). Tests that import `socks_proxy`/`resolver`/`netmonitor` pull in `httpx`
+and **skip** if it's absent — run in the project venv to exercise them.
+
+The **Windows** WinDivert path is covered too. `test_windows_handlers`:
+`udp_handler` in-place query→reply swap + INBOUND inject + fail-closed/`FAIL_OPEN`,
+and `tcp_proxy`/`https_proxy` redirect-to-relay-port + reply-src-rewrite + RST/FIN
+`_conn_map` cleanup + unknown-reply drop. `test_divert_dispatch`: `Diverter._dispatch`
+routing (UDP/53→pool, outbound :443 / relay-reply→HTTPS relay only when `DPI_BYPASS`,
+other TCP→DNS proxy, else pass-through) via a bare `__new__` Diverter with a
+synchronous stand-in pool. pydivert is pure-Python (the WinDivert kernel driver
+only loads when a handle is opened), so these import and their logic runs on macOS
+with a faked Packet; the modules **skip** only if pydivert isn't installed. No
+linter is configured.
 
 **Live verification** (the parts unit tests can't reach — real utun/network):
 `./verify_macos.sh [status|doh|cache|sni|ipv6|netchange|killswitch|vpn|all]`.

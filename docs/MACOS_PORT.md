@@ -51,6 +51,19 @@
 >    DoH 우회 경고, (b) VPN이 같은 `0/1`+`128/1` 트릭으로 디바이스 라우트를 뺏으면
 >    `tunnel.device_routes_intact`(`netstat -rn`)가 SNI 분할 우회 경고. `verify_macos.sh vpn`이 둘 다 확인. ([6절](#6-알려진-차이--한계-windows-대비))
 >
+> **추가 보강 (2026-07-02, 5차):**
+> 13. **테스트 커버리지 확장** — `tests/` 83개 → 134개 (+51). 새 파일 5개: (a) `test_resolver`
+>    — macOS 루프백 DoH 리졸버(UDP/TCP)의 fail-closed·TC 절단·길이 프리픽스 프레이밍
+>    (DoH는 `dnscache.resolve`에서 페이크); (b) `test_socks_proxy` — iface 핀/탐지
+>    (`set_bound_iface`/`physical_iface`)와 하드코딩-DNS `_dns_over_doh` 경로(fail-closed
+>    ·절단·permit 누수 없음); (c) `test_netutil` — `recv_exactly` 프레이밍 + `pump`;
+>    (d) `test_windows_handlers` — Windows WinDivert 핸들러(`udp_handler` 인플레이스
+>    스왑·INBOUND inject·fail-closed/`FAIL_OPEN`, `tcp_proxy`/`https_proxy`
+>    리다이렉트·reply src 복원·RST/FIN `_conn_map` 정리·미지 reply 드롭); (e)
+>    `test_divert_dispatch` — `Diverter._dispatch` 라우팅 분류. **pydivert는 순수 파이썬**
+>    (WinDivert 커널 드라이버는 핸들 open 시에만 로드)이라 Windows 핸들러도 가짜
+>    Packet으로 macOS에서 그대로 단위 테스트된다.
+>
 > **상태: 구현 완료 · 라이브 검증됨 (2026-06-26, macOS 26.5.1).**
 > macOS 포팅은 Windows의 WinDivert 패킷 캡처 모델을 쓰지 않는다. pf `rdr`로 같은
 > 모델을 재현하려던 1차 시도(아래 [부록 A](#부록-a--폐기된-pf-rdr-설계기록))는
