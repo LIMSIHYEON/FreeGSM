@@ -32,7 +32,7 @@ import threading
 
 from pydivert.consts import Direction
 
-from . import config, dpi
+from . import config, netutil
 
 log = logging.getLogger("dohproxy.https")
 
@@ -126,23 +126,6 @@ def _connect_upstream(server_ip: str, server_port: int) -> socket.socket:
 # --------------------------------------------------------------------------- #
 # Local relay server
 # --------------------------------------------------------------------------- #
-def _pump(src: socket.socket, dst: socket.socket) -> None:
-    """Copy src -> dst until EOF, then half-close dst's write side."""
-    try:
-        while True:
-            data = src.recv(65535)
-            if not data:
-                break
-            dst.sendall(data)
-    except OSError:
-        pass
-    finally:
-        try:
-            dst.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
-
-
 class _Handler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         client = self.request
@@ -169,45 +152,12 @@ class _Handler(socketserver.BaseRequestHandler):
             return
 
         try:
-            self._relay(client, upstream, server_ip, server_port)
+            # Shared relay: reassembles a multi-segment ClientHello, splits it
+            # into two TLS records, then pumps bidirectionally. Redirected :443
+            # connections always carry the real dest port 443.
+            netutil.split_relay(client, upstream, server_ip, server_port, log, "HTTPS")
         finally:
             upstream.close()
-
-    def _relay(self, client, upstream, server_ip, server_port) -> None:
-        # Read the first client segment -- the TLS ClientHello -- and re-emit it
-        # fragmented across two TLS records.
-        client.settimeout(config.HTTPS_FIRST_READ_TIMEOUT)
-        try:
-            first = client.recv(65535)
-        except (socket.timeout, OSError):
-            return
-        client.settimeout(None)
-        if not first:
-            return
-
-        try:
-            if first[0] == dpi._TLS_HANDSHAKE:
-                segs = dpi.split_hello(first, config.SPLIT_MIN, config.SPLIT_MAX)
-                log.info(
-                    "[HTTPS] %s:%d  SNI=%s  ClientHello %dB -> %d TLS records",
-                    server_ip, server_port, dpi.sni_name(first), len(first), len(segs),
-                )
-                for seg in segs:
-                    upstream.sendall(seg)
-            else:
-                # Not TLS (e.g. plaintext on 443): forward untouched.
-                upstream.sendall(first)
-        except OSError as exc:
-            log.debug("[HTTPS] %s:%d first write failed: %s", server_ip, server_port, exc)
-            return
-
-        # Dumb bidirectional pipe for the rest of the connection.
-        reverse = threading.Thread(
-            target=_pump, args=(upstream, client), name="https-pump", daemon=True
-        )
-        reverse.start()
-        _pump(client, upstream)
-        reverse.join(timeout=2.0)
 
 
 class _Server(socketserver.ThreadingTCPServer):

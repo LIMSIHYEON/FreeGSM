@@ -257,6 +257,15 @@ UPSTREAM_PORT_COUNT = 2048
 SPLIT_MIN = 6
 SPLIT_MAX = 64
 
+# Upper bound for reassembling a ClientHello that spans multiple TCP segments. A
+# TLS record body is capped at 2^14 by the spec, so a ClientHello record is at
+# most 16384+5 bytes. Modern hellos (post-quantum key shares like X25519MLKEM768,
+# ECH, many extensions) routinely exceed one ~1460-byte segment, so the relay's
+# first recv() returns only part of the record; netutil.recv_full_hello reads up
+# to this many bytes to complete it before splitting. A length field larger than
+# this is malformed -- recv_full_hello stops and split_hello forwards it untouched.
+MAX_CLIENT_HELLO = 16389
+
 # Relay timeouts (seconds).
 HTTPS_CONNECT_TIMEOUT = 8.0
 HTTPS_FIRST_READ_TIMEOUT = 8.0

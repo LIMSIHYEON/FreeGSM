@@ -31,6 +31,45 @@ def recv_exactly(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
+def recv_full_hello(sock: socket.socket, first: bytes, timeout: float,
+                    max_bytes: int = config.MAX_CLIENT_HELLO) -> bytes:
+    """Given the first chunk already read from a :443 client, keep reading until
+    the complete TLS ClientHello record is buffered.
+
+    A ClientHello that spans multiple TCP segments (post-quantum key shares, ECH,
+    or many extensions push it past one ~1460-byte segment) would otherwise reach
+    :func:`dpi.split_hello` incomplete, which forwards it un-split -- leaking the
+    SNI on exactly the connections that need the bypass. Reassembling the record
+    first lets the split always fire.
+
+    Returns as much as was read. On timeout / EOF / an oversized (malformed)
+    length field it may still be short of the full record, in which case
+    ``split_hello`` forwards it untouched -- fail-safe and byte-identical.
+    """
+    if not dpi.is_tls_handshake(first):
+        return first  # plaintext on :443; nothing to reassemble
+    buf = bytearray(first)
+    try:
+        sock.settimeout(timeout)
+        while len(buf) < max_bytes:
+            record_len, ok = dpi.tls_record_len(buf)
+            if ok and len(buf) >= record_len + 5:
+                break  # full record buffered
+            # Read only up to the record boundary (or the 5-byte header, if the
+            # header itself hasn't fully arrived) so we never over-read into the
+            # bytes that follow the ClientHello. Cap by the remaining budget too,
+            # so a bogus oversized length field can't pull past ``max_bytes``.
+            want = (record_len + 5 - len(buf)) if ok else (5 - len(buf))
+            want = min(want, max_bytes - len(buf))
+            chunk = sock.recv(max(1, min(65535, want)))
+            if not chunk:
+                break  # EOF before the record completed
+            buf.extend(chunk)
+    except OSError:
+        pass  # timeout/error: return what we have; split_hello stays fail-safe
+    return bytes(buf)
+
+
 def pump(src: socket.socket, dst: socket.socket) -> None:
     """Copy ``src`` -> ``dst`` until EOF, then half-close ``dst``'s write side.
 
@@ -76,9 +115,13 @@ def split_relay(client: socket.socket, upstream: socket.socket,
             first = client.recv(65535)
         except (socket.timeout, OSError):
             return
-        client.settimeout(None)
         if not first:
+            client.settimeout(None)
             return
+        # Complete the record if it arrived across multiple segments (large
+        # post-quantum / ECH hellos), or the split silently wouldn't fire.
+        first = recv_full_hello(client, first, config.HTTPS_FIRST_READ_TIMEOUT)
+        client.settimeout(None)
 
         try:
             if dpi.is_tls_handshake(first):

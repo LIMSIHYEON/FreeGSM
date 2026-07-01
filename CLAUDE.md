@@ -117,7 +117,10 @@ python -m unittest discover -s tests -v
 ```
 
 `tests/` covers the macOS port's pure/parsing logic (DPI split, DNS utils,
-config, `dnscache` TTL/keying/eviction, `netutil.recv_exactly` framing + `pump`)
+config, `dnscache` TTL/keying/eviction, `netutil.recv_exactly` framing + `pump`,
+`recv_full_hello` multi-segment ClientHello reassembly, and `split_relay`
+end-to-end over real socketpairs — a ClientHello fragments into two records while
+non-TLS / non-443 traffic stays byte-identical)
 and the systemy modules whose shell-outs / sockets are faked: `tunnel` IPv6
 device-redirect lifecycle + device-route hijack detection, `pf_control` kill
 switch (DNS + QUIC rules), `netmonitor` route-change trigger + route-socket loop
@@ -152,9 +155,14 @@ guided (you switch the link, it confirms the re-apply).
 QUIC/HTTP-3 (UDP/443): DPI-on drops it (`BLOCK_QUIC`) so HTTP/3 falls back to the
 fragmented TCP path; DPI-off it's untouched by default but opt-in
 `FREEGSM_BLOCK_PLAINTEXT_QUIC=1` drops it via pf (forces TCP; doesn't hide SNI).
-443 relay pipes through userspace Python (fine for browsing, slow for bulk). The
-split assumes the whole ClientHello arrives in the first `recv` (true for a
-<16 KB hello). The DNS cache (`dnscache.py`) is now used by **both ports** (macOS
+443 relay pipes through userspace Python (fine for browsing, slow for bulk). A
+ClientHello that spans multiple TCP segments (modern post-quantum/ECH hellos
+exceed one ~1460-byte segment) is now reassembled before splitting —
+`netutil.recv_full_hello` reads up to the record boundary (capped at
+`MAX_CLIENT_HELLO`, the 2^14 spec limit) so the split always fires instead of
+forwarding the hello un-split and leaking the SNI. Both relays share it (macOS
+`split_relay`; the Windows `https_proxy` relay was migrated onto `split_relay`
+too). The DNS cache (`dnscache.py`) is now used by **both ports** (macOS
 resolver + SOCKS UDP/53, and the Windows `udp_handler`/`tcp_proxy`).
 
 **macOS DoH coverage differs from Windows.** Windows captures *all* outbound
