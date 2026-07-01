@@ -58,6 +58,11 @@ killswitch_armed() { [ -f "$PF_MARKER" ]; }
 dig_qtime() { # $1=server $2=name -> "Query time" msec, or empty on failure
   dig "@$1" +tries=1 +timeout=3 "$2" 2>/dev/null | awk -F': ' '/Query time/{print $2}' | awk '{print $1}'
 }
+# First real A record from a `dig +short`, ignoring dig's own diagnostics: on a
+# timeout/refusal `dig +short` prints ";; connection timed out ..." to STDOUT, so
+# a bare `tail -n1` would mistake that error line for an answer. Filtering to a
+# literal IPv4 means a dropped/failed query yields empty (the real signal).
+first_ipv4() { grep -Eo '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | tail -n1; }
 
 require_running() {
   if ! dig @127.0.0.1 +tries=1 +timeout=3 +short example.com >/dev/null 2>&1; then
@@ -111,13 +116,13 @@ cmd_doh() {
   else
     fail "system resolver is '${ns:-<none>}', expected 127.0.0.1 (is FreeGSM running?)"
   fi
-  local ip; ip=$(dig @127.0.0.1 +tries=1 +timeout=4 +short example.com 2>/dev/null | tail -n1)
+  local ip; ip=$(dig @127.0.0.1 +tries=1 +timeout=4 +short example.com 2>/dev/null | first_ipv4)
   if [ -n "$ip" ]; then
     pass "loopback resolver answers (example.com -> $ip) -- DoH path live"
   else
     fail "loopback resolver did not answer (DoH round-trip failed / fail-closed)"
   fi
-  local iptcp; iptcp=$(dig @127.0.0.1 +tcp +tries=1 +timeout=4 +short example.com 2>/dev/null | tail -n1)
+  local iptcp; iptcp=$(dig @127.0.0.1 +tcp +tries=1 +timeout=4 +short example.com 2>/dev/null | first_ipv4)
   if [ -n "$iptcp" ]; then
     pass "TCP/53 path answers too (example.com -> $iptcp)"
   else
@@ -269,7 +274,7 @@ cmd_killswitch() {
     grep -q "port = 53"  "$rules" 2>/dev/null && dns_armed=1
     grep -q "port = 443" "$rules" 2>/dev/null && quic_armed=1
   fi
-  local probe; probe=$(dig @8.8.8.8 +tries=1 +timeout=3 +short example.com 2>/dev/null | tail -n1)
+  local probe; probe=$(dig @8.8.8.8 +tries=1 +timeout=3 +short example.com 2>/dev/null | first_ipv4)
   if killswitch_armed; then
     info "kill switch marker present -> armed (DPI off). DNS block: $([ $dns_armed = 1 ] && echo on || echo off), QUIC block: $([ $quic_armed = 1 ] && echo on || echo off)"
     if [ "$dns_armed" = 1 ]; then
