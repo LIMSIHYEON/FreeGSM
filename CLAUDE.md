@@ -126,8 +126,8 @@ detection + device-route hijack), `resolver` (UDP/TCP loopback DNS: fail-closed,
 TC-truncation, length-prefixed framing — DoH faked at `dnscache.resolve`), and
 `socks_proxy` (`_parse_dst`, iface pin/detect `set_bound_iface`/`physical_iface`,
 and the hardcoded-DNS `_dns_over_doh` path: fail-closed + truncation + no permit
-leak). Tests that import `socks_proxy`/`resolver`/`netmonitor` pull in `httpx`
-and **skip** if it's absent — run in the project venv to exercise them.
+leak). Tests that import `socks_proxy`/`resolver`/`netmonitor`/`dnscache` pull in
+`httpx` and **skip** if it's absent — run in the project venv to exercise them.
 
 The **Windows** WinDivert path is covered too. `test_windows_handlers`:
 `udp_handler` in-place query→reply swap + INBOUND inject + fail-closed/`FAIL_OPEN`,

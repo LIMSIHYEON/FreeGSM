@@ -5,6 +5,9 @@ on the question (case-insensitive, DO-bit-aware), hits rewrite the transaction I
 and 0x20 case and decrement every RR TTL, only safe responses are stored, and any
 malformed message falls through to an un-cached resolve. The clock is faked so
 expiry/decrement are deterministic.
+
+dnscache imports doh -> httpx; if httpx is absent (e.g. a Windows-only dev box)
+the whole module is skipped rather than failing import.
 """
 
 from __future__ import annotations
@@ -13,7 +16,11 @@ import struct
 import unittest
 from unittest import mock
 
-from dohproxy import dnscache
+try:
+    from dohproxy import dnscache
+except Exception as exc:  # noqa: BLE001 - httpx/doh may be absent in this env
+    dnscache = None
+    _IMPORT_ERR = exc
 
 
 # --------------------------------------------------------------------------- #
@@ -100,6 +107,7 @@ class _Clock:
         return self.t
 
 
+@unittest.skipIf(dnscache is None, "dnscache (httpx/doh) not importable here")
 class DnsCacheTest(unittest.TestCase):
     def setUp(self):
         dnscache.clear()
