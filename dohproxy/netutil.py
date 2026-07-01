@@ -80,12 +80,17 @@ def pump(src: socket.socket, dst: socket.socket) -> None:
         src.settimeout(config.RELAY_IDLE_TIMEOUT)
     except OSError:
         pass
+    # One reusable buffer per direction: recv_into avoids allocating a fresh bytes
+    # object each iteration, and the large size drains a backed-up receive queue in
+    # fewer syscalls -- the lever for bulk-transfer throughput.
+    buf = bytearray(config.RELAY_BUF_SIZE)
+    view = memoryview(buf)
     try:
         while True:
-            data = src.recv(65535)
-            if not data:
+            n = src.recv_into(buf)
+            if not n:
                 break
-            dst.sendall(data)
+            dst.sendall(view[:n])
     except OSError:  # includes socket.timeout (idle connection)
         pass
     finally:

@@ -18,6 +18,7 @@ import socket
 import struct
 import threading
 import unittest
+from unittest import mock
 
 from dohproxy import config, netutil
 
@@ -171,6 +172,29 @@ class PumpTest(unittest.TestCase):
                 break
             received += chunk
         self.assertEqual(bytes(received), b"hello world")
+
+    def test_reassembles_payload_larger_than_the_buffer(self):
+        # A payload bigger than RELAY_BUF_SIZE must be forwarded in full across
+        # multiple recv_into iterations (the reusable-buffer path must not drop or
+        # duplicate bytes). Shrink the buffer so a small payload still spans it.
+        src_a, src_b = socket.socketpair()
+        dst_a, dst_b = socket.socketpair()
+        self.addCleanup(lambda: [s.close() for s in (src_a, src_b, dst_a, dst_b)])
+
+        payload = bytes(range(256)) * 4  # 1024 bytes, distinct pattern
+        src_b.sendall(payload)
+        src_b.close()
+
+        with mock.patch.object(netutil.config, "RELAY_BUF_SIZE", 7):  # < payload
+            netutil.pump(src_a, dst_a)
+
+        received = bytearray()
+        while True:
+            chunk = dst_b.recv(65535)
+            if not chunk:
+                break
+            received += chunk
+        self.assertEqual(bytes(received), payload)
 
 
 class SplitRelayTest(unittest.TestCase):

@@ -266,6 +266,13 @@ SPLIT_MAX = 64
 # this is malformed -- recv_full_hello stops and split_hello forwards it untouched.
 MAX_CLIENT_HELLO = 16389
 
+# Data-copy buffer for the bidirectional relay pump. Each direction reads into one
+# reusable buffer of this size (recv_into, no per-iteration allocation); a larger
+# buffer drains a backed-up kernel receive queue in fewer syscalls, which is what
+# makes bulk transfers (the "slow for bulk" gap) faster on the userspace relay.
+# 256 KiB is a throughput/memory sweet spot -- two of these live per connection.
+RELAY_BUF_SIZE = 256 * 1024
+
 # Relay timeouts (seconds).
 HTTPS_CONNECT_TIMEOUT = 8.0
 HTTPS_FIRST_READ_TIMEOUT = 8.0

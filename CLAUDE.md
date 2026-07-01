@@ -117,7 +117,8 @@ python -m unittest discover -s tests -v
 ```
 
 `tests/` covers the macOS port's pure/parsing logic (DPI split, DNS utils,
-config, `dnscache` TTL/keying/eviction, `netutil.recv_exactly` framing + `pump`,
+config, `dnscache` TTL/keying/eviction, `netutil.recv_exactly` framing, `pump`
+(incl. the reusable-buffer path for payloads larger than `RELAY_BUF_SIZE`),
 `recv_full_hello` multi-segment ClientHello reassembly, and `split_relay`
 end-to-end over real socketpairs — a ClientHello fragments into two records while
 non-TLS / non-443 traffic stays byte-identical)
@@ -155,8 +156,12 @@ guided (you switch the link, it confirms the re-apply).
 QUIC/HTTP-3 (UDP/443): DPI-on drops it (`BLOCK_QUIC`) so HTTP/3 falls back to the
 fragmented TCP path; DPI-off it's untouched by default but opt-in
 `FREEGSM_BLOCK_PLAINTEXT_QUIC=1` drops it via pf (forces TCP; doesn't hide SNI).
-443 relay pipes through userspace Python (fine for browsing, slow for bulk). A
-ClientHello that spans multiple TCP segments (modern post-quantum/ECH hellos
+443 relay pipes through userspace Python; the bidirectional pump (`netutil.pump`,
+shared by both ports) reads into one reusable `RELAY_BUF_SIZE` (256 KiB) buffer
+via `recv_into`, so bulk transfers drain the kernel queue in fewer syscalls with
+no per-iteration allocation. Still userspace Python, so bulk stays slower than a
+kernel path, but the per-byte overhead is much lower than the old 64 KiB `recv`.
+A ClientHello that spans multiple TCP segments (modern post-quantum/ECH hellos
 exceed one ~1460-byte segment) is now reassembled before splitting —
 `netutil.recv_full_hello` reads up to the record boundary (capped at
 `MAX_CLIENT_HELLO`, the 2^14 spec limit) so the split always fires instead of
